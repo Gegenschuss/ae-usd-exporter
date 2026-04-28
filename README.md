@@ -34,7 +34,7 @@ AE parent/child relationships are preserved as nested USD prims. AE's local posi
 
 ## Install
 
-1. Save `export_to_houdini_draft.jsx` to your AE Scripts folder, or anywhere on disk.
+1. Save `GegenschussAeUsdExporter.jsx` to your AE Scripts folder, or anywhere on disk.
 2. In After Effects: `File → Scripts → Run Script File…` and pick the `.jsx`.
 3. Optional: drop it in `Adobe After Effects/Scripts/ScriptUI Panels/` to dock it as a panel.
 

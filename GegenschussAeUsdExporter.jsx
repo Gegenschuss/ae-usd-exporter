@@ -70,7 +70,7 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260427k";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260428a";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE \u2192 Houdini USD Exporter  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -388,7 +388,13 @@
         var nfo   = layerInfos[li];
         var layer = nfo.layer;
 
-        nfo.use2Node = nfo.isCam ? is2NodeCamera(layer) : false;
+        // Cameras AND lights use 2-node lookAt math when their autoOrient is
+        // CAMERA_OR_POINT_OF_INTEREST.  AE Parallel and Spot lights default to
+        // this — they aim from position toward pointOfInterest exactly like
+        // 2-node cameras.  Without this, a Parallel light's direction
+        // defaults to -Z (USD DistantLight convention) regardless of POI,
+        // which breaks shading on import.
+        nfo.use2Node = (nfo.isCam || nfo.isLight) ? is2NodeCamera(layer) : false;
 
         // mS[i] = [frame, m00..m22, tx, ty, tz]  (9 rotation + 3 translation values)
         var mS=[], flS=[], fdS=[], intS=[], colS=[], caS=[], cfS=[];
