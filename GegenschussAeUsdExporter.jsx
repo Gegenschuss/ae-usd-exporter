@@ -70,7 +70,7 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428j";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260428k";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE \u2192 Houdini USD  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -240,6 +240,50 @@
     if (layerInfos.length === 0) {
         alert("No eligible layers found.\n(3D switch must be on for AVLayers.)");
         return;
+    }
+
+    // ── Detect 2D AVLayer parents of exported layers ──────────────────────
+    // Cameras / lights / 3D nulls parented to a 2D layer can't compose their
+    // transform through the parent in USD because the 2D layer has no 3D
+    // transform.  Offer to flip the 3D switch on those parents and include
+    // them in the export so the hierarchy works.
+    var twoDParents = [];
+    var seenIdx = {};
+    for (var pi = 0; pi < layerInfos.length; pi++) {
+        var p = layerInfos[pi].layer.parent;
+        if (p && (p instanceof AVLayer) && !p.threeDLayer && !seenIdx[p.index]) {
+            seenIdx[p.index] = true;
+            twoDParents.push({ layer: p, child: layerInfos[pi].layer.name });
+        }
+    }
+    if (twoDParents.length > 0) {
+        var msg = "These exported layers are parented to 2D layers:\n\n";
+        for (var ti = 0; ti < twoDParents.length; ti++) {
+            msg += "  • " + twoDParents[ti].layer.name +
+                   "  →  " + twoDParents[ti].child + "\n";
+        }
+        msg += "\nThe 3D switch is off on the parents, so their transforms " +
+               "won't compose correctly through the hierarchy.\n\n" +
+               "Toggle 3D switch on and include them in the export?";
+        if (!confirm(msg, false, "2D parents detected")) return;
+
+        for (var ci3 = 0; ci3 < twoDParents.length; ci3++) {
+            var pl = twoDParents[ci3].layer;
+            try { pl.threeDLayer = true; } catch (e) {}
+            layerInfos.push({
+                layer:     pl,
+                isCam:     false,
+                isLight:   false,
+                isAV3D:    true,
+                isSpot:    false,
+                isAmbient: false,
+                isSolid:   false,
+                isFootage: false,
+                usdType:   "Xform",
+                subtype:   pl.nullLayer ? "Null" : "AVLayer",
+                primName:  makePrimName(pl.name, usedPrimNames)
+            });
+        }
     }
 
     // ── Build parent/child tree (AE parents → nested USD Xforms) ──────────
