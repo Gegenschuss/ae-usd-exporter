@@ -98,8 +98,54 @@
         return false;
     }
 
+    // ── Versioned backup helper ───────────────────────────────────────────
+    // Called once before any destructive AE-side change (2D-to-3D
+    // conversion, shape-layer split).  Uses AE's "Increment and Save" so
+    // the original .aep is preserved alongside an incremented copy that
+    // becomes the active project; falls back to a manual file copy if the
+    // menu command can't be found, and returns false if neither path is
+    // available (e.g. the project hasn't been saved yet).
+    var didBackup = false;
+    function ensureBackup() {
+        if (didBackup) return true;
+        if (!app.project.file) {
+            // Untitled project — no .aep to back up.  Warn but let the
+            // user choose to proceed; Cmd-Z is still available.
+            var ok = confirm(
+                "The project hasn't been saved yet, so no versioned " +
+                "backup can be made.\n\nProceed anyway?  Cmd-Z will " +
+                "undo any layer changes the export makes.", false);
+            didBackup = ok;
+            return ok;
+        }
+        try {
+            var cmdId = app.findMenuCommandId("Increment and Save");
+            if (cmdId) {
+                app.executeCommand(cmdId);
+                didBackup = true;
+                return true;
+            }
+        } catch (e) {}
+        // Fallback: copy the .aep with a timestamp suffix
+        try {
+            var src = app.project.file;
+            var ts  = new Date();
+            var pad = function (n) { return ("0" + n).slice(-2); };
+            var stamp = ts.getFullYear() + pad(ts.getMonth() + 1) +
+                        pad(ts.getDate()) + "_" + pad(ts.getHours()) +
+                        pad(ts.getMinutes()) + pad(ts.getSeconds());
+            var dst = new File(src.fsName.replace(/\.aep$/i,
+                "_pre-usd-export_" + stamp + ".aep"));
+            if (src.copy(dst)) {
+                didBackup = true;
+                return true;
+            }
+        } catch (e) {}
+        return false;
+    }
+
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428x";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260428aa";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE USD Exporter  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -427,7 +473,8 @@
 
         preDlg.show();
         if (!preProceed) return;
-
+        if (!ensureBackup()) return;
+        app.beginUndoGroup("AE USD Exporter — flip 2D layers to 3D");
         for (var ci3 = 0; ci3 < twoDList.length; ci3++) {
             var pl = twoDList[ci3].layer;
             try { pl.threeDLayer = true; } catch (e) {}
@@ -463,6 +510,144 @@
                 primName:  makePrimName(pl.name, usedPrimNames)
             });
         }
+        app.endUndoGroup();
+    }
+
+    // ── Preflight: shape layers with multiple shape groups ───────────────
+    // USD wants one mesh per Xform.  An AE shape layer can hold many
+    // top-level shape Groups under "Contents".  Offer to split those
+    // into separate ShapeLayers (one shape each) before export.
+    var multiShapeList = [];
+    for (var msi = 0; msi < layerInfos.length; msi++) {
+        if (!layerInfos[msi].isShape) continue;
+        var msContents;
+        try { msContents = layerInfos[msi].layer.property("Contents"); }
+        catch (e) { continue; }
+        if (!msContents || typeof msContents.numProperties !== "number") continue;
+        var msGroups = [];
+        for (var msj = 1; msj <= msContents.numProperties; msj++) {
+            var msp = msContents.property(msj);
+            if (msp && msp.matchName === "ADBE Vector Group") msGroups.push(msp.name);
+        }
+        if (msGroups.length > 1) {
+            multiShapeList.push({
+                nfoIdx: msi,
+                layer:  layerInfos[msi].layer,
+                groups: msGroups
+            });
+        }
+    }
+
+    if (multiShapeList.length > 0) {
+        var msDlg = new Window("dialog", "Preflight  ·  Multi-shape layers");
+        msDlg.orientation = "column";
+        msDlg.alignChildren = ["fill", "top"];
+        msDlg.spacing = 8;
+        msDlg.margins = 14;
+
+        msDlg.add("statictext", undefined,
+            multiShapeList.length + " shape layer" +
+            (multiShapeList.length === 1 ? "" : "s") +
+            " with multiple shape groups:");
+
+        var msLb = msDlg.add("listbox", undefined, [],
+            { multiselect: false, numberOfColumns: 2,
+              showHeaders: true, columnTitles: ["Shape layer", "Shapes"],
+              columnWidths: [220, 460] });
+        msLb.preferredSize.width = 700;
+        msLb.preferredSize.height = Math.max(180, Math.min(360, 32 + multiShapeList.length * 22));
+        for (var msk = 0; msk < multiShapeList.length; msk++) {
+            var msEntry = multiShapeList[msk];
+            var msItem = msLb.add("item", msEntry.layer.name);
+            msItem.subItems[0].text = msEntry.groups.length + " — " +
+                                       msEntry.groups.join(", ");
+        }
+
+        var msNote = msDlg.add("statictext", undefined,
+            "Each layer will be duplicated once per shape group and trimmed " +
+            "down to a single group, so every USD prim has one mesh.\n" +
+            "Cmd-Z reverts in AE if needed.", { multiline: true });
+        msNote.preferredSize.width = 700;
+
+        var msBtnGrp = msDlg.add("group");
+        msBtnGrp.alignment = "right";
+        var msBtnCancel = msBtnGrp.add("button", undefined, "Cancel");
+        var msBtnSplit  = msBtnGrp.add("button", undefined, "Split & Continue");
+
+        var msProceed = false;
+        msBtnSplit.onClick  = function () { msProceed = true;  msDlg.close(); };
+        msBtnCancel.onClick = function () { msProceed = false; msDlg.close(); };
+
+        msDlg.show();
+        if (!msProceed) return;
+        if (!ensureBackup()) return;
+        app.beginUndoGroup("AE USD Exporter — split multi-shape layers");
+
+        // Sort high-to-low so removing earlier layerInfos entries doesn't
+        // shift the indices we still need to remove.
+        multiShapeList.sort(function (a, b) { return b.nfoIdx - a.nfoIdx; });
+
+        for (var msSp = 0; msSp < multiShapeList.length; msSp++) {
+            var spEntry = multiShapeList[msSp];
+            var spLayer = spEntry.layer;
+            var spGroupNames = spEntry.groups;
+            var spNew = [];
+            // Duplicate once per group, then trim other groups out.
+            for (var spK = 0; spK < spGroupNames.length; spK++) {
+                var dup = spLayer.duplicate();
+                var dupContents = dup.property("Contents");
+                // Walk in reverse, keep only the spK-th Vector Group
+                var seenGroups = -1;
+                for (var spJ = dupContents.numProperties; spJ >= 1; spJ--) {
+                    var spProp = dupContents.property(spJ);
+                    if (spProp && spProp.matchName === "ADBE Vector Group") {
+                        // Find this group's original index
+                    }
+                }
+                // Easier: count groups front-to-back, mark which to remove
+                var groupIdx = 0;
+                var removeIdxs = [];
+                for (var spF = 1; spF <= dupContents.numProperties; spF++) {
+                    var spFp = dupContents.property(spF);
+                    if (spFp && spFp.matchName === "ADBE Vector Group") {
+                        if (groupIdx !== spK) removeIdxs.push(spF);
+                        groupIdx++;
+                    }
+                }
+                // Remove from the end so earlier indices stay valid
+                for (var spR = removeIdxs.length - 1; spR >= 0; spR--) {
+                    try { dupContents.property(removeIdxs[spR]).remove(); } catch (e) {}
+                }
+                // ASCII-only separator so the AE layer name (which becomes the
+                // USD prim doc string) doesn't introduce non-UTF-8 bytes.
+                dup.name = spLayer.name + " - " + spGroupNames[spK];
+                spNew.push(dup);
+            }
+
+            // Replace the original entry in layerInfos with the new split
+            // layers.  Remove the original AE layer last so we don't lose
+            // its reference mid-loop.
+            layerInfos.splice(spEntry.nfoIdx, 1);
+            for (var spI = 0; spI < spNew.length; spI++) {
+                layerInfos.push({
+                    layer:     spNew[spI],
+                    isCam:     false,
+                    isLight:   false,
+                    isAV3D:    true,
+                    isSpot:    false,
+                    isAmbient: false,
+                    isSolid:   false,
+                    isFootage: false,
+                    isText:    false,
+                    isShape:   true,
+                    usdType:   "Xform",
+                    subtype:   "Shape",
+                    primName:  makePrimName(spNew[spI].name, usedPrimNames)
+                });
+            }
+            try { spLayer.remove(); } catch (e) {}
+        }
+        app.endUndoGroup();
     }
 
     if (layerInfos.length === 0) {
@@ -816,9 +1001,14 @@
     // ExtendScript writeln() uses CR-only on Mac regardless of lineFeed setting.
     // Write the entire file as one string with explicit LF characters (\u000A).
     var content = out.join('\u000A') + '\u000A';
+    //
+    // Encoding: ExtendScript "binary" writes only the low byte of each UCS-2
+    // char, mangling anything above U+007F (e.g. U+00B7 "·" → raw byte 0xB7,
+    // invalid UTF-8). Hand-encode to UTF-8 so AE layer names with accents,
+    // umlauts, CJK etc. parse cleanly in USD/Houdini.
     outFile.encoding = "binary";
     outFile.open("w");
-    outFile.write(content);
+    outFile.write(toUtf8Bytes(content));
     outFile.close();
 
     // ── Success confirmation ──────────────────────────────────────────────
@@ -1303,6 +1493,42 @@
 
     function esc(s) {
         return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+    }
+
+    // UCS-2 JS string → UTF-8 byte string (each char's low byte == one UTF-8
+    // byte, suitable for File.write() under encoding = "binary").
+    function toUtf8Bytes(s) {
+        var out = "";
+        for (var i = 0; i < s.length; i++) {
+            var c = s.charCodeAt(i);
+            if (c < 0x80) {
+                out += String.fromCharCode(c);
+            } else if (c < 0x800) {
+                out += String.fromCharCode(0xC0 | (c >>> 6));
+                out += String.fromCharCode(0x80 | (c & 0x3F));
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
+                // Surrogate pair → 4-byte sequence
+                var c2 = s.charCodeAt(i + 1);
+                if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                    var cp = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
+                    out += String.fromCharCode(0xF0 | (cp >>> 18));
+                    out += String.fromCharCode(0x80 | ((cp >>> 12) & 0x3F));
+                    out += String.fromCharCode(0x80 | ((cp >>> 6)  & 0x3F));
+                    out += String.fromCharCode(0x80 | ( cp         & 0x3F));
+                    i++;
+                    continue;
+                }
+                // Lone high surrogate — fall through to 3-byte emit
+                out += String.fromCharCode(0xE0 | (c >>> 12));
+                out += String.fromCharCode(0x80 | ((c >>> 6) & 0x3F));
+                out += String.fromCharCode(0x80 | (c & 0x3F));
+            } else {
+                out += String.fromCharCode(0xE0 | (c >>> 12));
+                out += String.fromCharCode(0x80 | ((c >>> 6) & 0x3F));
+                out += String.fromCharCode(0x80 | (c & 0x3F));
+            }
+        }
+        return out;
     }
 
 })();
