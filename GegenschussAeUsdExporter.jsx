@@ -69,30 +69,107 @@
         catch (e) {}
     }
 
+    // Layer-type detection.  AE's `instanceof TextLayer` / `instanceof
+    // ShapeLayer` is unreliable across versions, and matchName alone can
+    // miss some cases.  Try every stable identifier we can think of and
+    // accept ANY positive signal.
+    function isTextLayer(l) {
+        if (!l) return false;
+        var mn;
+        try { mn = l.matchName; } catch (e) {}
+        if (mn === "ADBE Text Layer") return true;
+        try { if (l instanceof TextLayer) return true; } catch (e) {}
+        try { if (l.text) return true; } catch (e) {}                                  // .text exists
+        try { if (l.property("ADBE Text Properties") != null) return true; } catch (e) {}
+        try { if (l.property("Text") != null) return true; } catch (e) {}
+        return false;
+    }
+    function isShapeLayer(l) {
+        if (!l) return false;
+        var mn;
+        try { mn = l.matchName; } catch (e) {}
+        if (mn === "ADBE Vector Layer") return true;
+        try { if (l instanceof ShapeLayer) return true; } catch (e) {}
+        try { if (l.property("ADBE Root Vectors Group") != null) return true; } catch (e) {}
+        try {
+            var c = l.property("Contents");
+            if (c && typeof c.numProperties === "number") return true;
+        } catch (e) {}
+        return false;
+    }
+
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428n";  // bump on each meaningful change (YYMMDD)
-    var dlg = new Window("dialog", "AE \u2192 Houdini USD  " + BUILD_DATE);
+    var BUILD_DATE = "260428x";  // bump on each meaningful change (YYMMDD)
+    var dlg = new Window("dialog", "AE USD Exporter  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
     dlg.spacing = 6;
     dlg.margins = 14;
 
-    // Comp summary — so the user knows what they're about to export.
-    var nCams = 0, nLights = 0, nXforms = 0;
-    for (var i = 1; i <= comp.numLayers; i++) {
-        var l = comp.layer(i);
-        if (l instanceof CameraLayer) nCams++;
-        else if (l instanceof LightLayer) nLights++;
-        else if ((l instanceof AVLayer) && l.threeDLayer) nXforms++;
+    // Comp + layer breakdown summary.
+    var nCams = 0, nLights = 0, nNulls = 0, nSolids = 0, nFootage = 0,
+        nText = 0, nShape = 0, nOther = 0;
+    var n2DText = 0, n2DShape = 0;   // 2D layers users typically want exported
+    for (var ic = 1; ic <= comp.numLayers; ic++) {
+        var lyrC = comp.layer(ic);
+        if (lyrC instanceof CameraLayer) { nCams++; continue; }
+        if (lyrC instanceof LightLayer)  { nLights++; continue; }
+        // Don't gate on `instanceof AVLayer` — that's been seen to fail
+        // for genuine AVLayers in some AE versions.  Anything that isn't
+        // a camera or light is treated as a potential AVLayer.
+        var is3D = false;
+        try { is3D = !!lyrC.threeDLayer; } catch (e) {}
+        if (is3D) {
+            var isNull3D = false;
+            try { isNull3D = !!lyrC.nullLayer; } catch (e) {}
+            if (isNull3D)              { nNulls++;   continue; }
+            if (isTextLayer(lyrC))     { nText++;    continue; }
+            if (isShapeLayer(lyrC))    { nShape++;   continue; }
+            try {
+                if (lyrC.source && lyrC.source.mainSource) {
+                    if (lyrC.source.mainSource instanceof SolidSource) { nSolids++;  continue; }
+                    if (lyrC.source.mainSource instanceof FileSource)  { nFootage++; continue; }
+                }
+            } catch (e) {}
+            nOther++;
+        } else {
+            // 2D layer — flag text/shape as commonly-intended-for-3D so the
+            // summary shows them even before the user flips the 3D switch
+            // or selects them for the preflight.
+            if      (isTextLayer(lyrC))  n2DText++;
+            else if (isShapeLayer(lyrC)) n2DShape++;
+        }
     }
-    var compFps = (Math.round(comp.frameRate * 1000) / 1000);
-    var compFrames = Math.round(comp.duration * comp.frameRate);
-    var compInfo = comp.name + "  ·  " + comp.width + " × " + comp.height +
-                   "  ·  " + compFps + " fps  ·  " + compFrames + " frames";
-    var layerInfo = nCams + " cam  ·  " + nLights + " light  ·  " + nXforms + " xform";
+    var compFps    = Math.round(comp.frameRate * 1000) / 1000;
+    var compFrames = Math.round(comp.duration  * comp.frameRate);
+    var par        = comp.pixelAspect;
+    var resStr     = comp.width + " × " + comp.height +
+                     (par !== 1 ? "  (PAR " + par + ")" : "");
+    var compInfo   = comp.name + "  ·  " + resStr + "  ·  " +
+                     compFps + " fps  ·  " + compFrames + " frames";
+
+    var parts = [];
+    if (nCams)    parts.push(nCams    + " cam");
+    if (nLights)  parts.push(nLights  + " light");
+    if (nNulls)   parts.push(nNulls   + " null");
+    if (nSolids)  parts.push(nSolids  + " solid");
+    if (nFootage) parts.push(nFootage + " footage");
+    if (nText)    parts.push(nText    + " text");
+    if (nShape)   parts.push(nShape   + " shape");
+    if (nOther)   parts.push(nOther   + " xform");
+    var layerInfo = parts.length ? parts.join("  ·  ") : "(no eligible 3D layers)";
+
+    var twoDParts = [];
+    if (n2DText)  twoDParts.push(n2DText  + " text");
+    if (n2DShape) twoDParts.push(n2DShape + " shape");
+    var twoDInfo = twoDParts.length
+        ? "+ " + twoDParts.join("  ·  ") + " in 2D (select & re-run to include)"
+        : "";
+
     dlg.add("statictext", undefined, compInfo);
     dlg.add("statictext", undefined, layerInfo);
-    dlg.add("panel");   // thin separator
+    if (twoDInfo) dlg.add("statictext", undefined, twoDInfo);
+    dlg.add("panel");
 
     // Scale + Clip near/far on one row
     var grpRow1 = dlg.add("group");
@@ -114,25 +191,34 @@
     var rbSingle = grpRange.add("radiobutton", undefined, "Current");
     var rbWork   = grpRange.add("radiobutton", undefined, "Work area");
     var rbFull   = grpRange.add("radiobutton", undefined, "Full comp");
-    var savedRange = loadPref("frameRange", "work");
+    var savedRange = loadPref("frameRange", "full");
     rbSingle.value = (savedRange === "single");
     rbWork.value   = (savedRange === "work");
     rbFull.value   = (savedRange === "full");
 
-    var chkAll = dlg.add("checkbox", undefined, "Export all 3D layers");
-    chkAll.value = (loadPref("exportAll", "1") === "1");
-
-    var chkVisible = dlg.add("checkbox", undefined,
-        "Visible layers only  (off = include eyeball-off / non-solo'd)");
+    var chkVisible = dlg.add("checkbox", undefined, "Visible only");
     chkVisible.value = (loadPref("visibleOnly", "1") === "1");
 
-    var chkCenter = dlg.add("checkbox", undefined, "Centre comp at world origin");
-    chkCenter.value = (loadPref("centerOffset", "1") === "1");
-
     var grpBtns = dlg.add("group");
-    grpBtns.alignment = "right";
-    var btnSave   = grpBtns.add("button", undefined, "Save\u2026");
+    grpBtns.alignment = ["fill", "top"];
+    var btnReset = grpBtns.add("button", undefined, "Reset");
+    btnReset.alignment = ["left", "center"];
+    var spacer = grpBtns.add("group");
+    spacer.alignment = ["fill", "fill"];
     var btnCancel = grpBtns.add("button", undefined, "Cancel");
+    btnCancel.alignment = ["right", "center"];
+    var btnSave   = grpBtns.add("button", undefined, "Save\u2026");
+    btnSave.alignment   = ["right", "center"];
+
+    btnReset.onClick = function () {
+        scaleInput.text  = "100";
+        nearInput.text   = "0.1";
+        farInput.text    = "100000";
+        rbSingle.value   = false;
+        rbWork.value     = false;
+        rbFull.value     = true;
+        chkVisible.value = true;
+    };
 
     var outFile = null;
     btnCancel.onClick = function () { dlg.close(); };
@@ -154,17 +240,15 @@
     var scale        = parseFloat(scaleInput.text) || 100;
     var clipNear     = parseFloat(nearInput.text)  || 0.1;
     var clipFar      = parseFloat(farInput.text)   || 100000;
-    var centerOffset = chkCenter.value;
+    var centerOffset = true;                  // always centre comp at world origin
     var visibleOnly  = chkVisible.value;
 
     // Persist for next run.
-    savePref("scale",        scaleInput.text);
-    savePref("clipNear",     nearInput.text);
-    savePref("clipFar",      farInput.text);
-    savePref("frameRange",   rbSingle.value ? "single" : (rbFull.value ? "full" : "work"));
-    savePref("exportAll",    chkAll.value     ? "1" : "0");
-    savePref("visibleOnly",  chkVisible.value ? "1" : "0");
-    savePref("centerOffset", chkCenter.value  ? "1" : "0");
+    savePref("scale",       scaleInput.text);
+    savePref("clipNear",    nearInput.text);
+    savePref("clipFar",     farInput.text);
+    savePref("frameRange",  rbSingle.value ? "single" : (rbFull.value ? "full" : "work"));
+    savePref("visibleOnly", chkVisible.value ? "1" : "0");
 
     // ── Frame range ───────────────────────────────────────────────────────
     var fps = comp.frameRate;
@@ -205,26 +289,38 @@
         var lyr     = comp.layer(idx);
         var isCam   = (lyr instanceof CameraLayer);
         var isLight = (lyr instanceof LightLayer);
-        var isAV3D  = (lyr instanceof AVLayer) && lyr.threeDLayer;
+        // Don't gate on `instanceof AVLayer` — see counter loop above.
+        var isAV3D = false;
+        if (!isCam && !isLight) {
+            try { isAV3D = !!lyr.threeDLayer; } catch (e) {}
+        }
 
         if (!isCam && !isLight && !isAV3D) continue;
-        if (visibleOnly && !lyr.enabled)             continue;  // eyeball off
-        if (visibleOnly && anySolo && !lyr.solo)     continue;  // solo'd elsewhere
-        if (!chkAll.value && !lyr.selected)           continue;
+        if (visibleOnly && !lyr.enabled)         continue;  // eyeball off
+        if (visibleOnly && anySolo && !lyr.solo) continue;  // solo'd elsewhere
 
         var lt        = isLight ? lyr.lightType : null;
         var isSpot    = isLight && (lt === LightType.SPOT);
         var isAmbient = isLight && (lt === LightType.AMBIENT);
         var isSolid   = false;
         var isFootage = false;
-        // AE solids are FootageItems whose mainSource is a SolidSource —
-        // the solid colour and metadata live on the source, not the layer.
-        // Footage layers (still images, video) have a FileSource mainSource
-        // and a real file on disk we can bind as a USD texture.
+        var isText    = false;
+        var isShape   = false;
+        // Detect AVLayer subtypes so writePrim can emit the right kind of
+        // geometry: solids → coloured quad, footage → textured quad,
+        // text/shape → bounding-box quad with a representative colour.
+        // CRITICAL: AE null layers use a SolidSource internally, so the
+        // SolidSource check must be guarded by !nullLayer or every null
+        // gets a Mesh.  Same for the text/shape branches — null layers
+        // shouldn't be classified as anything but null.
         try {
-            if (isAV3D && lyr.source && lyr.source.mainSource) {
-                isSolid   = (lyr.source.mainSource instanceof SolidSource);
-                isFootage = (lyr.source.mainSource instanceof FileSource);
+            if (isAV3D && !lyr.nullLayer) {
+                isText  = isTextLayer(lyr);
+                isShape = isShapeLayer(lyr);
+                if (!isText && !isShape && lyr.source && lyr.source.mainSource) {
+                    isSolid   = (lyr.source.mainSource instanceof SolidSource);
+                    isFootage = (lyr.source.mainSource instanceof FileSource);
+                }
             }
         } catch (e) {}
 
@@ -237,37 +333,60 @@
             isAmbient: isAmbient,
             isSolid:   isSolid,
             isFootage: isFootage,
+            isText:    isText,
+            isShape:   isShape,
             usdType:   resolveUSDType(isCam, isLight, lt),
             subtype:   resolveSubtype(isCam, isLight, lt, lyr),
             primName:  makePrimName(lyr.name, usedPrimNames)
         });
     }
 
-    if (layerInfos.length === 0) {
-        alert("No eligible layers found.\n(3D switch must be on for AVLayers.)");
-        return;
-    }
-
-    // ── Preflight: 2D AVLayer parents of exported layers ─────────────────
-    // Cameras / lights / 3D nulls parented to a 2D layer can't compose
-    // their transform through the parent (the 2D layer has no 3D
-    // transform).  Group affected children by 2D parent and ask the user
-    // to convert.
+    // ── Preflight: 2D AVLayers to convert ────────────────────────────────
+    // Two ways a 2D layer ends up here:
+    //   1. It's the parent of an exported 3D camera/light/AVLayer — the
+    //      child can't compose its transform through a non-3D parent.
+    //   2. It's selected in the timeline.  This is how users opt 2D text /
+    //      shape / solid / footage layers into the export — flip the 3D
+    //      switch on demand instead of having to do it manually first.
     var twoDByIdx = {};
     var twoDList  = [];
-    for (var pi = 0; pi < layerInfos.length; pi++) {
-        var p = layerInfos[pi].layer.parent;
-        if (p && (p instanceof AVLayer) && !p.threeDLayer) {
-            if (!twoDByIdx[p.index]) {
-                var entry = { layer: p, children: [] };
-                twoDByIdx[p.index] = entry;
-                twoDList.push(entry);
-            }
-            twoDByIdx[p.index].children.push(layerInfos[pi].layer.name);
+    function addTwoD(p, childName) {
+        // p must be a non-camera, non-light, non-3D, enabled layer.
+        if (!p) return;
+        if (p instanceof CameraLayer || p instanceof LightLayer) return;
+        var threeD;
+        try { threeD = !!p.threeDLayer; } catch (e) { return; }
+        if (threeD) return;
+        try { if (!p.enabled) return; } catch (e) { return; }
+        if (!twoDByIdx[p.index]) {
+            var entry = { layer: p, children: [], selected: false };
+            twoDByIdx[p.index] = entry;
+            twoDList.push(entry);
         }
+        if (childName) twoDByIdx[p.index].children.push(childName);
+        try { if (p.selected) twoDByIdx[p.index].selected = true; } catch (e) {}
     }
+    // 2D parents of existing 3D layers
+    for (var pi = 0; pi < layerInfos.length; pi++) {
+        addTwoD(layerInfos[pi].layer.parent, layerInfos[pi].layer.name);
+    }
+    // Selected non-3D layers — user-picked candidates
+    for (var si = 1; si <= comp.numLayers; si++) {
+        var sl = comp.layer(si);
+        var slIsCam = (sl instanceof CameraLayer);
+        var slIsLight = (sl instanceof LightLayer);
+        if (slIsCam || slIsLight) continue;
+        var sl3D = false;
+        try { sl3D = !!sl.threeDLayer; } catch (e) {}
+        var slEn = false;
+        try { slEn = !!sl.enabled; } catch (e) {}
+        var slSel = false;
+        try { slSel = !!sl.selected; } catch (e) {}
+        if (!sl3D && slEn && slSel) addTwoD(sl, null);
+    }
+
     if (twoDList.length > 0) {
-        var preDlg = new Window("dialog", "Preflight  ·  2D layer parents");
+        var preDlg = new Window("dialog", "Preflight  ·  2D layers");
         preDlg.orientation = "column";
         preDlg.alignChildren = ["fill", "top"];
         preDlg.spacing = 8;
@@ -275,33 +394,36 @@
 
         preDlg.add("statictext", undefined,
             twoDList.length + " 2D layer" + (twoDList.length === 1 ? "" : "s") +
-            " used as parent of 3D layers:");
+            " ready to flip to 3D:");
 
         var lb = preDlg.add("listbox", undefined, [],
             { multiselect: false, numberOfColumns: 2,
-              showHeaders: true, columnTitles: ["2D layer", "Used by"],
+              showHeaders: true, columnTitles: ["2D layer", "Why"],
               columnWidths: [220, 460] });
         lb.preferredSize.width = 700;
         lb.preferredSize.height = Math.max(180, Math.min(360, 32 + twoDList.length * 22));
         for (var ti = 0; ti < twoDList.length; ti++) {
-            var item = lb.add("item", twoDList[ti].layer.name);
-            item.subItems[0].text = twoDList[ti].children.join(", ");
+            var entryT = twoDList[ti];
+            var item = lb.add("item", entryT.layer.name);
+            var why = [];
+            if (entryT.selected) why.push("selected");
+            if (entryT.children.length) why.push("parent of " + entryT.children.join(", "));
+            item.subItems[0].text = why.join("  ·  ");
         }
 
         var note = preDlg.add("statictext", undefined,
-            "3D switch is off on these layers — transforms won't compose " +
-            "through the hierarchy.\nFlip them to 3D and include them in " +
-            "the export?", { multiline: true });
+            "3D switch is off on these layers — flip them to 3D and " +
+            "include them in the export?", { multiline: true });
         note.preferredSize.width = 700;
 
         var btnGrp = preDlg.add("group");
         btnGrp.alignment = "right";
         var btnConvert = btnGrp.add("button", undefined, "Convert & Continue");
-        var btnCancel  = btnGrp.add("button", undefined, "Cancel");
+        var btnPreCancel = btnGrp.add("button", undefined, "Cancel");
 
         var preProceed = false;
-        btnConvert.onClick = function () { preProceed = true;  preDlg.close(); };
-        btnCancel.onClick  = function () { preProceed = false; preDlg.close(); };
+        btnConvert.onClick   = function () { preProceed = true;  preDlg.close(); };
+        btnPreCancel.onClick = function () { preProceed = false; preDlg.close(); };
 
         preDlg.show();
         if (!preProceed) return;
@@ -309,6 +431,22 @@
         for (var ci3 = 0; ci3 < twoDList.length; ci3++) {
             var pl = twoDList[ci3].layer;
             try { pl.threeDLayer = true; } catch (e) {}
+            // Re-detect the AVLayer subtype now that it's 3D, so the
+            // mesh writer picks the right kind of geometry.
+            var pIsText  = isTextLayer(pl);
+            var pIsShape = isShapeLayer(pl);
+            var pIsSolid = false, pIsFootage = false;
+            try {
+                if (!pIsText && !pIsShape && pl.source && pl.source.mainSource) {
+                    pIsSolid   = (pl.source.mainSource instanceof SolidSource);
+                    pIsFootage = (pl.source.mainSource instanceof FileSource);
+                }
+            } catch (e) {}
+            var pSubtype = pl.nullLayer ? "Null" :
+                           pIsText      ? "Text" :
+                           pIsShape     ? "Shape" :
+                           pIsSolid     ? "Solid" :
+                           pIsFootage   ? "Footage" : "AVLayer";
             layerInfos.push({
                 layer:     pl,
                 isCam:     false,
@@ -316,13 +454,20 @@
                 isAV3D:    true,
                 isSpot:    false,
                 isAmbient: false,
-                isSolid:   false,
-                isFootage: false,
+                isSolid:   pIsSolid,
+                isFootage: pIsFootage,
+                isText:    pIsText,
+                isShape:   pIsShape,
                 usdType:   "Xform",
-                subtype:   pl.nullLayer ? "Null" : "AVLayer",
+                subtype:   pSubtype,
                 primName:  makePrimName(pl.name, usedPrimNames)
             });
         }
+    }
+
+    if (layerInfos.length === 0) {
+        alert("No eligible layers found.\n(3D switch must be on for AVLayers.)");
+        return;
     }
 
     // ── Build parent/child tree (AE parents → nested USD Xforms) ──────────
@@ -363,8 +508,8 @@
             return "Light";
         }
         if (layer.nullLayer) return "Null";
-        try { if (layer instanceof ShapeLayer) return "Shape"; } catch (e) {}
-        try { if (layer instanceof TextLayer)  return "Text";  } catch (e) {}
+        if (isShapeLayer(layer)) return "Shape";
+        if (isTextLayer(layer))  return "Text";
         try {
             if (layer.source && layer.source.mainSource) {
                 if (layer.source.mainSource instanceof SolidSource) return "Solid";
@@ -677,18 +822,33 @@
     outFile.close();
 
     // ── Success confirmation ──────────────────────────────────────────────
-    var nCams=0, nLights=0, nXforms=0, nParented=0;
+    var nCams=0, nLights=0, nNulls=0, nSolidsX=0, nFootageX=0, nTextX=0,
+        nShapeX=0, nOtherX=0, nParented=0;
     for (var ci2 = 0; ci2 < layerInfos.length; ci2++) {
-        if (layerInfos[ci2].isCam)        nCams++;
-        else if (layerInfos[ci2].isLight) nLights++;
-        else                              nXforms++;
-        if (layerInfos[ci2].layer.parent) nParented++;
+        var n = layerInfos[ci2];
+        if      (n.isCam)     nCams++;
+        else if (n.isLight)   nLights++;
+        else if (n.layer.nullLayer) nNulls++;
+        else if (n.isSolid)   nSolidsX++;
+        else if (n.isFootage) nFootageX++;
+        else if (n.isText)    nTextX++;
+        else if (n.isShape)   nShapeX++;
+        else                  nOtherX++;
+        if (n.layer.parent) nParented++;
     }
     var nFrames = endFrame - startFrame + 1;
+    var doneParts = [];
+    if (nCams)     doneParts.push(nCams     + " cam");
+    if (nLights)   doneParts.push(nLights   + " light");
+    if (nNulls)    doneParts.push(nNulls    + " null");
+    if (nSolidsX)  doneParts.push(nSolidsX  + " solid");
+    if (nFootageX) doneParts.push(nFootageX + " footage");
+    if (nTextX)    doneParts.push(nTextX    + " text");
+    if (nShapeX)   doneParts.push(nShapeX   + " shape");
+    if (nOtherX)   doneParts.push(nOtherX   + " xform");
     var summary =
         "Exported " + layerInfos.length + " prims  (" +
-        nCams + " cam, " + nLights + " light, " + nXforms + " xform; " +
-        nParented + " parented)\n" +
+        doneParts.join(", ") + "; " + nParented + " parented)\n" +
         "Frames: " + startFrame + "–" + endFrame + "  (" + nFrames + ")\n" +
         outPath;
 
@@ -780,6 +940,8 @@
         // origin so rotation/scale pivot correctly.
         if (nfo.isSolid)        writeSolidGeo(out, ind2, nfo);
         else if (nfo.isFootage) writeFootageGeo(out, ind2, nfo);
+        else if (nfo.isText)    writeTextGeo(out, ind2, nfo);
+        else if (nfo.isShape)   writeShapeGeo(out, ind2, nfo);
 
         for (var ci = 0; ci < nfo.children.length; ci++) {
             out.push('');
@@ -904,6 +1066,84 @@
         arr.push(ind3 + 'float2 outputs:result');
         arr.push(ind2 + '}');
         arr.push(ind + '}');
+    }
+
+    // Bounding-box quad mesh — used by text and shape layers, where the
+    // "geometry" varies per frame and isn't a simple width × height.  AE's
+    // sourceRectAtTime gives us {left, top, width, height} relative to
+    // the anchor point, so the corners are already anchor-relative.
+    // Sampled at the export start frame; if the layer's bounds animate,
+    // the mesh stays at that snapshot (transform animation still applies).
+    function writeBoundsGeo(arr, ind, nfo, color) {
+        var rect;
+        try { rect = nfo.layer.sourceRectAtTime(startFrame / fps, false); }
+        catch (e) { return; }
+        if (!rect || rect.width <= 0 || rect.height <= 0) return;
+
+        var L = rect.left, T = rect.top;
+        var R = L + rect.width, B = T + rect.height;
+        var c = color || [0.5, 0.5, 0.5];
+
+        function toUsd(x, y) {
+            return '(' + fmt(x / scale) + ', ' + fmt(-y / scale) + ', 0)';
+        }
+        var ind2 = ind + I1;
+        arr.push(ind + 'def Mesh "geo"');
+        arr.push(ind + '{');
+        arr.push(ind2 + 'point3f[] points = [' +
+            toUsd(L, B) + ', ' + toUsd(R, B) + ', ' + toUsd(R, T) + ', ' + toUsd(L, T) + ']');
+        arr.push(ind2 + 'int[] faceVertexCounts = [4]');
+        arr.push(ind2 + 'int[] faceVertexIndices = [0, 1, 2, 3]');
+        arr.push(ind2 + 'bool doubleSided = 1');
+        arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
+            fmt(c[0]) + ', ' + fmt(c[1]) + ', ' + fmt(c[2]) + ')]');
+        arr.push(ind + '}');
+    }
+
+    // Text layer → bounding-box quad coloured with the text's fill colour.
+    // Real glyph geometry would mean tessellating fonts, which is out of
+    // scope; the bounding box gives correct placement and a useful colour
+    // proxy for relighting / compositing.
+    function writeTextGeo(arr, ind, nfo) {
+        var c = [1, 1, 1];
+        try {
+            var td = nfo.layer.text.sourceText.valueAtTime(startFrame / fps, false);
+            if (td && td.fillColor) c = td.fillColor;
+        } catch (e) {}
+        writeBoundsGeo(arr, ind, nfo, c);
+    }
+
+    // Shape layer → bounding-box quad coloured with the first solid Fill
+    // found in the layer's contents tree.  Strokes, gradients, and merge-
+    // path operators aren't tessellated — would need real path → polygon
+    // conversion to reproduce the shape proper.  For most production use
+    // (overlays, lower-thirds), the bounding box plus colour is enough.
+    function writeShapeGeo(arr, ind, nfo) {
+        var c = [0.5, 0.5, 0.5];
+        try {
+            var found = findFirstFill(nfo.layer.property("Contents"));
+            if (found) c = found;
+        } catch (e) {}
+        writeBoundsGeo(arr, ind, nfo, c);
+    }
+
+    function findFirstFill(prop) {
+        if (!prop || !prop.numProperties) return null;
+        for (var i = 1; i <= prop.numProperties; i++) {
+            var sub;
+            try { sub = prop.property(i); } catch (e) { continue; }
+            if (sub && sub.matchName === "ADBE Vector Graphic - Fill") {
+                try {
+                    var col = sub.property("Color").value;
+                    if (col) return col;
+                } catch (e) {}
+            }
+            if (sub && sub.numProperties) {
+                var found = findFirstFill(sub);
+                if (found) return found;
+            }
+        }
+        return null;
     }
 
     // Layer in/out points → USD visibility.  No emission if the layer is
