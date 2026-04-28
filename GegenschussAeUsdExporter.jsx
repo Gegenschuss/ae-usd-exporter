@@ -70,48 +70,47 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428c";  // bump on each meaningful change (YYMMDD)
-    var dlg = new Window("dialog", "AE \u2192 Houdini USD Exporter  " + BUILD_DATE);
+    var BUILD_DATE = "260428d";  // bump on each meaningful change (YYMMDD)
+    var dlg = new Window("dialog", "AE \u2192 Houdini USD  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
-    dlg.spacing = 10;
-    dlg.margins = 16;
+    dlg.spacing = 6;
+    dlg.margins = 14;
 
-    var grpScale = dlg.add("group");
-    grpScale.add("statictext", undefined, "Scale  (AE pixels \u2192 Houdini units):");
-    var scaleInput = grpScale.add("edittext", undefined, loadPref("scale", "100"));
-    scaleInput.preferredSize.width = 70;
+    // Scale + Clip near/far on one row
+    var grpRow1 = dlg.add("group");
+    grpRow1.alignChildren = ["left", "center"];
+    grpRow1.add("statictext", undefined, "Scale");
+    var scaleInput = grpRow1.add("edittext", undefined, loadPref("scale", "100"));
+    scaleInput.preferredSize.width = 50;
+    grpRow1.add("statictext", undefined, "px / m   Clip");
+    var nearInput = grpRow1.add("edittext", undefined, loadPref("clipNear", "0.1"));
+    nearInput.preferredSize.width = 45;
+    grpRow1.add("statictext", undefined, "\u2013");
+    var farInput = grpRow1.add("edittext", undefined, loadPref("clipFar", "100000"));
+    farInput.preferredSize.width = 65;
 
-    var grpClip = dlg.add("group");
-    grpClip.add("statictext", undefined, "Clipping  near:");
-    var nearInput = grpClip.add("edittext", undefined, loadPref("clipNear", "0.1"));
-    nearInput.preferredSize.width = 60;
-    grpClip.add("statictext", undefined, "  far:");
-    var farInput = grpClip.add("edittext", undefined, loadPref("clipFar", "100000"));
-    farInput.preferredSize.width = 80;
-
-    var pnlRange = dlg.add("panel", undefined, "Frame range");
-    pnlRange.orientation = "row";
-    pnlRange.margins = [10, 14, 10, 10];
-    var rbSingle = pnlRange.add("radiobutton", undefined, "Current frame");
-    var rbWork   = pnlRange.add("radiobutton", undefined, "Work area");
-    var rbFull   = pnlRange.add("radiobutton", undefined, "Full comp");
+    // Frame range inline
+    var grpRange = dlg.add("group");
+    grpRange.alignChildren = ["left", "center"];
+    grpRange.add("statictext", undefined, "Frames");
+    var rbSingle = grpRange.add("radiobutton", undefined, "Current");
+    var rbWork   = grpRange.add("radiobutton", undefined, "Work area");
+    var rbFull   = grpRange.add("radiobutton", undefined, "Full comp");
     var savedRange = loadPref("frameRange", "work");
     rbSingle.value = (savedRange === "single");
     rbWork.value   = (savedRange === "work");
     rbFull.value   = (savedRange === "full");
 
-    var chkAll = dlg.add("checkbox", undefined,
-        "Export ALL eligible layers  (uncheck = selected layers only)");
+    var chkAll = dlg.add("checkbox", undefined, "Export all 3D layers");
     chkAll.value = (loadPref("exportAll", "1") === "1");
 
-    var chkCenter = dlg.add("checkbox", undefined,
-        "Centre comp at world origin  (shift by −w/2, +h/2)");
+    var chkCenter = dlg.add("checkbox", undefined, "Centre comp at world origin");
     chkCenter.value = (loadPref("centerOffset", "1") === "1");
 
     var grpBtns = dlg.add("group");
     grpBtns.alignment = "right";
-    var btnSave   = grpBtns.add("button", undefined, "Save .usda\u2026");
+    var btnSave   = grpBtns.add("button", undefined, "Save\u2026");
     var btnCancel = grpBtns.add("button", undefined, "Cancel");
 
     var outFile = null;
