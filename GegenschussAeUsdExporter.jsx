@@ -69,8 +69,23 @@
         catch (e) {}
     }
 
+    // ── Grey theme ────────────────────────────────────────────────────────
+    // ScriptUI dialogs default to OS chrome, which clashes with AE's dark
+    // panel UI.  Recursively paint backgrounds + foregrounds to match.
+    var UI_BG = [0.22, 0.22, 0.22, 1];
+    var UI_FG = [0.85, 0.85, 0.85, 1];
+    function applyGrey(c) {
+        try { c.graphics.backgroundColor = c.graphics.newBrush(
+            c.graphics.BrushType.SOLID_COLOR, UI_BG); } catch (e) {}
+        try { c.graphics.foregroundColor = c.graphics.newPen(
+            c.graphics.PenType.SOLID_COLOR, UI_FG, 1); } catch (e) {}
+        if (c.children) {
+            for (var i = 0; i < c.children.length; i++) applyGrey(c.children[i]);
+        }
+    }
+
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428k";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260428l";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE \u2192 Houdini USD  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -140,6 +155,7 @@
         if (outFile) dlg.close();
     };
 
+    applyGrey(dlg);
     dlg.show();
     if (!outFile) return;
 
@@ -242,33 +258,66 @@
         return;
     }
 
-    // ── Detect 2D AVLayer parents of exported layers ──────────────────────
-    // Cameras / lights / 3D nulls parented to a 2D layer can't compose their
-    // transform through the parent in USD because the 2D layer has no 3D
-    // transform.  Offer to flip the 3D switch on those parents and include
-    // them in the export so the hierarchy works.
-    var twoDParents = [];
-    var seenIdx = {};
+    // ── Preflight: 2D AVLayer parents of exported layers ─────────────────
+    // Cameras / lights / 3D nulls parented to a 2D layer can't compose
+    // their transform through the parent (the 2D layer has no 3D
+    // transform).  Group affected children by 2D parent and ask the user
+    // to convert.
+    var twoDByIdx = {};
+    var twoDList  = [];
     for (var pi = 0; pi < layerInfos.length; pi++) {
         var p = layerInfos[pi].layer.parent;
-        if (p && (p instanceof AVLayer) && !p.threeDLayer && !seenIdx[p.index]) {
-            seenIdx[p.index] = true;
-            twoDParents.push({ layer: p, child: layerInfos[pi].layer.name });
+        if (p && (p instanceof AVLayer) && !p.threeDLayer) {
+            if (!twoDByIdx[p.index]) {
+                var entry = { layer: p, children: [] };
+                twoDByIdx[p.index] = entry;
+                twoDList.push(entry);
+            }
+            twoDByIdx[p.index].children.push(layerInfos[pi].layer.name);
         }
     }
-    if (twoDParents.length > 0) {
-        var msg = "These exported layers are parented to 2D layers:\n\n";
-        for (var ti = 0; ti < twoDParents.length; ti++) {
-            msg += "  • " + twoDParents[ti].layer.name +
-                   "  →  " + twoDParents[ti].child + "\n";
-        }
-        msg += "\nThe 3D switch is off on the parents, so their transforms " +
-               "won't compose correctly through the hierarchy.\n\n" +
-               "Toggle 3D switch on and include them in the export?";
-        if (!confirm(msg, false, "2D parents detected")) return;
+    if (twoDList.length > 0) {
+        var preDlg = new Window("dialog", "Preflight  ·  2D layer parents");
+        preDlg.orientation = "column";
+        preDlg.alignChildren = ["fill", "top"];
+        preDlg.spacing = 8;
+        preDlg.margins = 14;
 
-        for (var ci3 = 0; ci3 < twoDParents.length; ci3++) {
-            var pl = twoDParents[ci3].layer;
+        preDlg.add("statictext", undefined,
+            twoDList.length + " 2D layer" + (twoDList.length === 1 ? "" : "s") +
+            " used as parent of 3D layers:");
+
+        var lb = preDlg.add("listbox", undefined, [],
+            { multiselect: false, numberOfColumns: 2,
+              showHeaders: true, columnTitles: ["2D layer", "Used by"] });
+        lb.preferredSize.width = 460;
+        lb.preferredSize.height = Math.min(220, 24 + twoDList.length * 22);
+        for (var ti = 0; ti < twoDList.length; ti++) {
+            var item = lb.add("item", twoDList[ti].layer.name);
+            item.subItems[0].text = twoDList[ti].children.join(", ");
+        }
+
+        var note = preDlg.add("statictext", undefined,
+            "3D switch is off on these layers — transforms won't compose " +
+            "through the hierarchy.\nFlip them to 3D and include them in " +
+            "the export?", { multiline: true });
+        note.preferredSize.width = 460;
+
+        var btnGrp = preDlg.add("group");
+        btnGrp.alignment = "right";
+        var btnConvert = btnGrp.add("button", undefined, "Convert & Continue");
+        var btnCancel  = btnGrp.add("button", undefined, "Cancel");
+
+        var preProceed = false;
+        btnConvert.onClick = function () { preProceed = true;  preDlg.close(); };
+        btnCancel.onClick  = function () { preProceed = false; preDlg.close(); };
+
+        applyGrey(preDlg);
+        preDlg.show();
+        if (!preProceed) return;
+
+        for (var ci3 = 0; ci3 < twoDList.length; ci3++) {
+            var pl = twoDList[ci3].layer;
             try { pl.threeDLayer = true; } catch (e) {}
             layerInfos.push({
                 layer:     pl,
@@ -667,6 +716,7 @@
     btnReveal.onClick = function () { try { outFile.parent.execute(); } catch (e) {} };
     btnOpen.onClick   = function () { try { outFile.execute();        } catch (e) {} };
     btnDone.onClick   = function () { doneDlg.close(); };
+    applyGrey(doneDlg);
     doneDlg.show();
 
     // ── USD writer helpers ────────────────────────────────────────────────
