@@ -70,7 +70,7 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428i";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260428j";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE \u2192 Houdini USD  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -210,11 +210,16 @@
         var isSpot    = isLight && (lt === LightType.SPOT);
         var isAmbient = isLight && (lt === LightType.AMBIENT);
         var isSolid   = false;
+        var isFootage = false;
         // AE solids are FootageItems whose mainSource is a SolidSource —
         // the solid colour and metadata live on the source, not the layer.
+        // Footage layers (still images, video) have a FileSource mainSource
+        // and a real file on disk we can bind as a USD texture.
         try {
-            isSolid = isAV3D && lyr.source && lyr.source.mainSource &&
-                      (lyr.source.mainSource instanceof SolidSource);
+            if (isAV3D && lyr.source && lyr.source.mainSource) {
+                isSolid   = (lyr.source.mainSource instanceof SolidSource);
+                isFootage = (lyr.source.mainSource instanceof FileSource);
+            }
         } catch (e) {}
 
         layerInfos.push({
@@ -225,6 +230,7 @@
             isSpot:    isSpot,
             isAmbient: isAmbient,
             isSolid:   isSolid,
+            isFootage: isFootage,
             usdType:   resolveUSDType(isCam, isLight, lt),
             subtype:   resolveSubtype(isCam, isLight, lt, lyr),
             primName:  makePrimName(lyr.name, usedPrimNames)
@@ -277,8 +283,10 @@
         try { if (layer instanceof ShapeLayer) return "Shape"; } catch (e) {}
         try { if (layer instanceof TextLayer)  return "Text";  } catch (e) {}
         try {
-            if (layer.source && layer.source.mainSource &&
-                layer.source.mainSource instanceof SolidSource) return "Solid";
+            if (layer.source && layer.source.mainSource) {
+                if (layer.source.mainSource instanceof SolidSource) return "Solid";
+                if (layer.source.mainSource instanceof FileSource) return "Footage";
+            }
         } catch (e) {}
         return "AVLayer";
     }
@@ -449,6 +457,14 @@
             if (nfo.use2Node) {
                 var poi = [rawPos[0], rawPos[1], rawPos[2]];
                 try { poi = layer.pointOfInterest.valueAtTime(t, false); } catch(e) {}
+                // pointOfInterest is in WORLD (comp) space, but position is
+                // in PARENT space.  If the camera/light has a parent, convert
+                // POI into the parent's local space so the lookAt math
+                // composes correctly.  Without this, a parented camera with
+                // an animated parent yields a rotation that mixes spaces.
+                if (layer.parent) {
+                    try { poi = layer.parent.fromWorld(poi, t); } catch (e) {}
+                }
                 Rae = m3mul(lookAtMatrix(rawPos, poi),
                             aeRotMatrix(rp.ori, rp.xr, rp.yr, rp.zr));
             } else {
@@ -667,15 +683,20 @@
             }
         }
 
+        // Visibility: AE layers have inPoint/outPoint defining when they're
+        // active in the comp.  Outside that window, mark the prim invisible
+        // so Houdini hides it at the right times.  No-op if the layer is
+        // visible across the entire export range.
+        writeVisibility(out, ind2, nfo.layer);
+
         if (!nfo.isAmbient) writeMat4(out, ind2, nfo.mS);
 
-        // Solid → emit a flat quad Mesh inside the Xform so the layer shows
-        // up as actual geometry in Houdini.  Coordinates are in AE pixels
-        // local to the layer, scaled to USD units and Y-flipped, with the
-        // anchor point treated as the local origin (so rotation pivots
-        // correctly around AE's anchor).  doubleSided so both sides render
-        // — AE solids are flat 2D layers without a defined back face.
-        if (nfo.isSolid) writeSolidGeo(out, ind2, nfo);
+        // Geometry: solids → flat quad with displayColor; footage layers
+        // → flat quad with a UsdPreviewSurface material binding the source
+        // file as a texture.  Both use the AE anchor as the mesh local
+        // origin so rotation/scale pivot correctly.
+        if (nfo.isSolid)        writeSolidGeo(out, ind2, nfo);
+        else if (nfo.isFootage) writeFootageGeo(out, ind2, nfo);
 
         for (var ci = 0; ci < nfo.children.length; ci++) {
             out.push('');
@@ -718,6 +739,125 @@
         arr.push(ind2 + 'bool doubleSided = 1');
         arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
             fmt(c[0]) + ', ' + fmt(c[1]) + ', ' + fmt(c[2]) + ')]');
+        arr.push(ind + '}');
+    }
+
+    // Footage layer (still image / video file) → flat quad with a
+    // UsdPreviewSurface material binding the source file as a texture.
+    // Same vertex layout as solids; UVs are corner-mapped (full image).
+    // Renders cleanly in Karma; Houdini's Hydra viewport shows the texture
+    // in real time.  Falls back to plain mesh + grey displayColor if the
+    // source file path can't be resolved.
+    function writeFootageGeo(arr, ind, nfo) {
+        var src = nfo.layer.source;
+        var w = src.width, h = src.height;
+        var anchor = [w/2, h/2, 0];
+        try { anchor = nfo.layer.anchorPoint.value; } catch (e) {}
+
+        var assetPath = "";
+        try { assetPath = src.mainSource.file.fsName.replace(/\\/g, '/'); }
+        catch (e) {}
+
+        var tl = [0 - anchor[0], 0 - anchor[1], 0];
+        var tr = [w - anchor[0], 0 - anchor[1], 0];
+        var br = [w - anchor[0], h - anchor[1], 0];
+        var bl = [0 - anchor[0], h - anchor[1], 0];
+        function toUsd(p) {
+            return '(' + fmt(p[0] / scale) + ', ' + fmt(-p[1] / scale) + ', 0)';
+        }
+
+        var ind2 = ind + I1;
+        var ind3 = ind2 + I1;
+
+        arr.push(ind + 'def Mesh "geo" (');
+        if (assetPath) arr.push(ind2 + 'prepend apiSchemas = ["MaterialBindingAPI"]');
+        arr.push(ind + ')');
+        arr.push(ind + '{');
+        arr.push(ind2 + 'point3f[] points = [' +
+            toUsd(bl) + ', ' + toUsd(br) + ', ' + toUsd(tr) + ', ' + toUsd(tl) + ']');
+        arr.push(ind2 + 'int[] faceVertexCounts = [4]');
+        arr.push(ind2 + 'int[] faceVertexIndices = [0, 1, 2, 3]');
+        arr.push(ind2 + 'bool doubleSided = 1');
+        arr.push(ind2 + 'texCoord2f[] primvars:st = [(0, 0), (1, 0), (1, 1), (0, 1)] (');
+        arr.push(ind3 + 'interpolation = "vertex"');
+        arr.push(ind2 + ')');
+        if (assetPath) {
+            arr.push(ind2 + 'rel material:binding = <mat>');
+        } else {
+            arr.push(ind2 + 'color3f[] primvars:displayColor = [(0.5, 0.5, 0.5)]');
+        }
+        arr.push(ind + '}');
+
+        if (!assetPath) return;
+
+        // Material: PreviewSurface with a UsdUVTexture sampling the AE
+        // footage file via a PrimvarReader on the "st" primvar.
+        arr.push(ind + 'def Material "mat"');
+        arr.push(ind + '{');
+        arr.push(ind2 + 'token outputs:surface.connect = <Shader.outputs:surface>');
+        arr.push('');
+        arr.push(ind2 + 'def Shader "Shader"');
+        arr.push(ind2 + '{');
+        arr.push(ind3 + 'uniform token info:id = "UsdPreviewSurface"');
+        arr.push(ind3 + 'color3f inputs:diffuseColor.connect = <../Tex.outputs:rgb>');
+        arr.push(ind3 + 'float inputs:opacity.connect = <../Tex.outputs:a>');
+        arr.push(ind3 + 'int inputs:useSpecularWorkflow = 0');
+        arr.push(ind3 + 'token outputs:surface');
+        arr.push(ind2 + '}');
+        arr.push('');
+        arr.push(ind2 + 'def Shader "Tex"');
+        arr.push(ind2 + '{');
+        arr.push(ind3 + 'uniform token info:id = "UsdUVTexture"');
+        arr.push(ind3 + 'asset inputs:file = @' + assetPath + '@');
+        arr.push(ind3 + 'float2 inputs:st.connect = <../PrimvarReader.outputs:result>');
+        arr.push(ind3 + 'float3 outputs:rgb');
+        arr.push(ind3 + 'float outputs:a');
+        arr.push(ind2 + '}');
+        arr.push('');
+        arr.push(ind2 + 'def Shader "PrimvarReader"');
+        arr.push(ind2 + '{');
+        arr.push(ind3 + 'uniform token info:id = "UsdPrimvarReader_float2"');
+        arr.push(ind3 + 'token inputs:varname = "st"');
+        arr.push(ind3 + 'float2 outputs:result');
+        arr.push(ind2 + '}');
+        arr.push(ind + '}');
+    }
+
+    // Layer in/out points → USD visibility.  No emission if the layer is
+    // visible across the entire export range (default = "inherited" = visible).
+    // If layer is fully outside the range, emit a single static "invisible".
+    // Otherwise emit timeSamples at the in/out boundaries.
+    function writeVisibility(arr, ind, layer) {
+        var inFrame, outFrame;
+        try {
+            inFrame  = Math.round(layer.inPoint  * fps);
+            outFrame = Math.round(layer.outPoint * fps) - 1;   // outPoint exclusive
+        } catch (e) { return; }
+
+        var enters = (inFrame  > startFrame);
+        var exits  = (outFrame < endFrame);
+
+        // Visible across the whole range — nothing to emit.
+        if (!enters && !exits) return;
+
+        // Fully outside our range — mark static invisible.
+        if (outFrame < startFrame || inFrame > endFrame) {
+            arr.push(ind + 'token visibility = "invisible"');
+            return;
+        }
+
+        // Partial overlap — emit transition timeSamples.  Token attrs hold
+        // their value until the next sample, so two or three keys are enough.
+        arr.push(ind + 'token visibility.timeSamples = {');
+        if (enters) {
+            arr.push(ind + '    ' + startFrame + ': "invisible",');
+            arr.push(ind + '    ' + inFrame    + ': "inherited",');
+        } else {
+            arr.push(ind + '    ' + startFrame + ': "inherited",');
+        }
+        if (exits) {
+            arr.push(ind + '    ' + (outFrame + 1) + ': "invisible",');
+        }
         arr.push(ind + '}');
     }
 
