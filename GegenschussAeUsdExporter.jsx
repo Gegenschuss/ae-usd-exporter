@@ -70,7 +70,7 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260428f";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260428g";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE \u2192 Houdini USD  " + BUILD_DATE);
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -634,8 +634,12 @@
             // intensity scaling we set in samplePhase to read sensibly.
             out.push(ind2 + 'bool inputs:normalize = 1');
             if (nfo.usdType === 'SphereLight') {
-                out.push(ind2 + 'float inputs:radius = 0');
-                out.push(ind2 + 'bool inputs:treatAsPoint = 1');
+                // Small positive radius instead of treatAsPoint=1.  A
+                // zero-radius sphere with treatAsPoint is ambiguous in
+                // USDLux and Karma renders it as black.  10 cm is small
+                // enough to feel point-like at typical scene scales (~m)
+                // while still being a well-defined area light.
+                out.push(ind2 + 'float inputs:radius = 0.1');
             }
             if (nfo.isSpot && nfo.caS.length) {
                 writeScalar(out, ind2, 'float', 'inputs:shaping:cone:angle',    nfo.caS);
