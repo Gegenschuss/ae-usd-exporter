@@ -35,7 +35,7 @@ rotation: (rx, -ry, -rz)
 
 AE parent/child relationships are preserved as nested USD prims. AE's local position/rotation/scale composes correctly through the nesting.
 
-Text and shape geometry is **real triangulated mesh** built by walking each layer's bezier paths and ear-clipping them. Text routes through AE's `Create Shapes from Text` command on a duplicate so the original layer is preserved. Animated text (sourceText keyframes, range-selector animators, expression-driven content) is detected and re-extracted per frame, producing timeSampled `points` (and timeSampled topology when vertex count changes between frames); static text is sampled once at the export start frame. Polygons-with-holes (letter "O") render filled — the inner outline isn't subtracted in v1. Stroke / Trim Paths / Merge Paths / Repeater operators fall back to a bounding-box quad.
+Text and shape geometry is **real triangulated mesh** built by walking each layer's bezier paths and ear-clipping them. Text routes through AE's `Create Shapes from Text` command on a duplicate so the original layer is preserved. Animated text (sourceText keyframes, range-selector animators, expression-driven content) is detected and re-extracted per frame, producing timeSampled `points` (and timeSampled topology when vertex count changes between frames); static text is sampled once at the export start frame. Polygons-with-holes (letter "O", "8", donuts) have their counters subtracted — inner contours are classified by winding and bridged out before triangulation. Trim Paths / Merge Paths / Repeater and other shape operators fall back to a bounding-box quad.
 
 ## Install
 
@@ -93,7 +93,7 @@ Matches AE's render-time visibility:
 
 ## Known limitations
 
-- Text and shape geometry is **triangulated outline only** for fills, plus a sibling **`BasisCurves`** for stroke-only paths.  Gradients, multi-fill effects, drop-shadows etc. are not represented.  Polygons-with-holes (letter "O") render filled (no hole subtraction in v1).  Trim Paths, Merge Paths, Repeater, Wiggle Paths and other shape operators are skipped silently — the layer falls back to a bounding-box quad if no extractable paths are found.
+- Text and shape geometry is **triangulated outline only** for fills, plus a sibling **`BasisCurves`** for stroke-only paths.  Gradients, multi-fill effects, drop-shadows etc. are not represented (a multi-colour fill flattens to its first colour).  Counters (letter "O", "8") are subtracted; deeply-nested compound shapes ("@") fall back to filled.  Trim Paths, Merge Paths, Repeater, Wiggle Paths and other shape operators are skipped silently — the layer falls back to a bounding-box quad if no extractable paths are found.
 - Layers parented to a non-exported (2D) layer become roots with a parent-relative transform — world position will be wrong. The 2D-layer preflight catches this when the parent is in the same comp.
 - Camera **film width** isn't reachable from ExtendScript, so the dialog asks for it (default 36 mm).  If your AE comp uses APS-C / S35 / etc., set the value before exporting.
 - Lights export the AE light type and intensity/colour/cone params but haven't been visually verified across all four light types in Houdini/Karma.

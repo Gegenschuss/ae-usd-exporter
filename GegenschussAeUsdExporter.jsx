@@ -147,7 +147,7 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260429aw";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260429bb";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE → Houdini USD Exporter");
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -414,6 +414,22 @@
     var outFile = null;
     btnCancel.onClick = function () { dlg.close(); };
     btnSave.onClick = function () {
+        // Validate numeric fields BEFORE opening the save dialog, so bad input
+        // is caught while the fields are still editable (instead of being
+        // silently coerced to defaults after the dialog closes).
+        function bad(x) { return !(x > 0) || !isFinite(x); }
+        var sc = parseFloat(scaleInput.text),
+            cn = parseFloat(nearInput.text),
+            cf = parseFloat(farInput.text),
+            fw = parseFloat(filmInput.text);
+        if (bad(sc) || bad(cn) || bad(cf) || bad(fw)) {
+            alert("Scale, Clip Near/Far and Film Width must all be positive numbers.");
+            return;
+        }
+        if (cf <= cn) {
+            alert("Clip Far must be greater than Clip Near.");
+            return;
+        }
         var defaultName = (comp.name || "untitled").replace(/[^a-zA-Z0-9_]/g, '_') + ".usda";
         var defaultDir  = (app.project.file ? app.project.file.parent : Folder.desktop);
         var defaultFile = new File(defaultDir.fsName + "/" + defaultName);
@@ -421,6 +437,7 @@
         if (outFile) dlg.close();
     };
 
+    dlg.defaultElement = btnSave;   // Enter triggers Save, not Reset
     dlg.show();
     if (!outFile) return;
 
@@ -448,10 +465,12 @@
     var expandPrecomps = chkExpandPrecomps.value;
 
     // Persist for next run.
-    savePref("scale",       scaleInput.text);
-    savePref("clipNear",    nearInput.text);
-    savePref("clipFar",     farInput.text);
-    savePref("filmWidth",   filmInput.text);
+    // Store the parsed, normalised numbers (not raw text) so a stray value
+    // can't round-trip back in next run.
+    savePref("scale",       "" + scale);
+    savePref("clipNear",    "" + clipNear);
+    savePref("clipFar",     "" + clipFar);
+    savePref("filmWidth",   "" + FILM_WIDTH_MM);
     savePref("frameRange",  rbSingle.value ? "single" : (rbFull.value ? "full" : "work"));
     savePref("visibleOnly", chkVisible.value  ? "1" : "0");
     savePref("pathsCam",    chkPathCam.value  ? "1" : "0");
@@ -480,6 +499,18 @@
         startFrame = 0;
         endFrame   = Math.round(comp.duration * fps) - 1;
     }
+    // Guard an empty / inverted range (zero-length work area, or a single
+    // frame parked at frame 0): a backwards range yields a zero-iteration
+    // sample loop → transform-less prims and an inverted start/end timeCode.
+    if (endFrame < startFrame) endFrame = startFrame;
+
+    // AE timeline display offset.  A comp can number its displayed frames from
+    // a non-zero value (timecode-locked editorial comps).  We keep SAMPLING in
+    // comp time (frame/fps from 0), but shift every emitted USD frame label and
+    // timeCode by this so the export lines up with the AE timeline the user
+    // sees.  Zero for ordinary comps → no change to output.
+    var frameOffset = 0;
+    try { frameOffset = Math.round(comp.displayStartTime * fps); } catch (e) {}
 
     // USD aperture/focal = tenths of scene unit.  metersPerUnit = 1, so
     // 0.1 unit = 10 mm → divide physical mm values by 100.
@@ -487,7 +518,12 @@
     // matches FILM_WIDTH_MM and apertureV is scaled by comp aspect.
     var MM_TO_USD = 1 / 100;
     var apertureH = FILM_WIDTH_MM * MM_TO_USD;
-    var apertureV = FILM_WIDTH_MM * comp.height / comp.width * MM_TO_USD;
+    // Divide by pixelAspect: with non-square pixels the image aspect is
+    // (width·PAR)/height, so apertureV/apertureH = height/(width·PAR).
+    // PAR = 1 for square pixels → identical to the old formula.
+    var par = 1;
+    try { if (comp.pixelAspect > 1e-6) par = comp.pixelAspect; } catch (e) {}
+    var apertureV = FILM_WIDTH_MM * comp.height / (comp.width * par) * MM_TO_USD;
 
     // ── Collect eligible layers ───────────────────────────────────────────
     // Match AE's render-time visibility:
@@ -496,6 +532,12 @@
     //   - shy/locked   → exported normally (they still render)
     var layerInfos    = [];
     var usedPrimNames = {};
+    // Reserve the hard-coded sub-prim names so no layer prim can collide with a
+    // sibling Mesh "geo" / Material "mat" / BasisCurves "stroke" when a
+    // geo-emitting layer also has a child layer of that name.
+    usedPrimNames["geo"]    = true;
+    usedPrimNames["mat"]    = true;
+    usedPrimNames["stroke"] = true;
 
     var anySolo = false;
     for (var s = 1; s <= comp.numLayers; s++) {
@@ -780,15 +822,8 @@
             for (var spK = 0; spK < spGroupNames.length; spK++) {
                 var dup = spLayer.duplicate();
                 var dupContents = dup.property("Contents");
-                // Walk in reverse, keep only the spK-th Vector Group
-                var seenGroups = -1;
-                for (var spJ = dupContents.numProperties; spJ >= 1; spJ--) {
-                    var spProp = dupContents.property(spJ);
-                    if (spProp && spProp.matchName === "ADBE Vector Group") {
-                        // Find this group's original index
-                    }
-                }
-                // Easier: count groups front-to-back, mark which to remove
+                // Count Vector Groups front-to-back; mark all but the spK-th
+                // for removal so this duplicate keeps a single group.
                 var groupIdx = 0;
                 var removeIdxs = [];
                 for (var spF = 1; spF <= dupContents.numProperties; spF++) {
@@ -1183,10 +1218,10 @@
     }
 
     // Ear-clipping triangulation.  Handles simple (non-self-intersecting)
-    // polygons; assumes a single closed loop.  Polygons with holes (e.g.
-    // letter "O") render filled — outer + inner outline both get filled
-    // and the hole isn't subtracted.  Acceptable v1 trade-off; libtess-quality
-    // hole handling is a future polish item.
+    // polygons; assumes a single closed loop.  Polygons with holes (letter
+    // "O", "8", donuts) are handled upstream by buildPolygonsWithHoles, which
+    // bridges each hole into its outer ring with a keyhole edge before this
+    // runs — so a counter is correctly subtracted, not filled.
     function earClipTriangulate(verts) {
         var n = verts.length;
         if (n < 3) return [];
@@ -1233,7 +1268,16 @@
         for (var k = 0; k < idx.length; k++) {
             var j = idx[k];
             if (j === i0 || j === i1 || j === i2) continue;
-            if (pointInTriangle(verts[j], p0, p1, p2)) return false;
+            var pj = verts[j];
+            // Skip points coincident with a triangle corner.  Keyhole bridges
+            // (hole subtraction, buildPolygonsWithHoles) duplicate the bridge
+            // endpoints; a duplicate sitting exactly on a corner would
+            // otherwise veto every ear and stall the clip.  No effect on
+            // ordinary polygons, whose vertices are all distinct.
+            if ((Math.abs(pj[0]-p0[0])<1e-7 && Math.abs(pj[1]-p0[1])<1e-7) ||
+                (Math.abs(pj[0]-p1[0])<1e-7 && Math.abs(pj[1]-p1[1])<1e-7) ||
+                (Math.abs(pj[0]-p2[0])<1e-7 && Math.abs(pj[1]-p2[1])<1e-7)) continue;
+            if (pointInTriangle(pj, p0, p1, p2)) return false;
         }
         return true;
     }
@@ -1245,6 +1289,140 @@
         var hasNeg = d1 < 0 || d2 < 0 || d3 < 0;
         var hasPos = d1 > 0 || d2 > 0 || d3 > 0;
         return !(hasNeg && hasPos);
+    }
+
+    // ── Polygon hole subtraction ──────────────────────────────────────────
+    // Glyphs and compound shapes arrive as several closed rings (e.g. letter
+    // "O" = outer + inner contour).  In fonts/AE the hole is wound OPPOSITE
+    // to its outer.  We classify each ring as outer or hole (immediate-parent
+    // containment + winding sign), then bridge every hole into its outer with
+    // a zero-width "keyhole" edge, yielding one simple polygon per outer that
+    // the ear-clipper triangulates with the counter correctly subtracted.
+    // Verified independently against synthetic O / 8 / L / 48-gon / nested
+    // cases before shipping.
+
+    function ringSignedArea(poly) {
+        var a = 0;
+        for (var i = 0; i < poly.length; i++) {
+            var j = (i + 1) % poly.length;
+            a += poly[i][0] * poly[j][1] - poly[j][0] * poly[i][1];
+        }
+        return a / 2;
+    }
+    function ringSign(x) { return x < 0 ? -1 : (x > 0 ? 1 : 0); }
+
+    // Ray-cast (even-odd) point-in-polygon.  Used only to nest rings; glyph
+    // contours don't intersect, so one representative vertex decides.
+    function pointInPolygon(pt, poly) {
+        var inside = false, n = poly.length;
+        for (var i = 0, j = n - 1; i < n; j = i++) {
+            var xi = poly[i][0], yi = poly[i][1], xj = poly[j][0], yj = poly[j][1];
+            var hit = ((yi > pt[1]) !== (yj > pt[1])) &&
+                      (pt[0] < (xj - xi) * (pt[1] - yi) / (yj - yi) + xi);
+            if (hit) inside = !inside;
+        }
+        return inside;
+    }
+    // Strict (proper) crossing of segments ab and cd — shared endpoints don't
+    // count, which is what bridge validation needs.
+    function segProperIntersect(a, b, c, d) {
+        function o(p, q, r) { return (q[0]-p[0])*(r[1]-p[1]) - (q[1]-p[1])*(r[0]-p[0]); }
+        var o1 = o(a,b,c), o2 = o(a,b,d), o3 = o(c,d,a), o4 = o(c,d,b);
+        return ((o1 > 0) !== (o2 > 0)) && ((o3 > 0) !== (o4 > 0));
+    }
+    // A bridge outer[io]→hole[ih] is valid if it crosses no edge of either
+    // ring (edges incident to the endpoints excluded).
+    function bridgeOk(outer, hole, io, ih) {
+        var A = outer[io], B = hole[ih];
+        for (var i = 0; i < outer.length; i++) {
+            var j = (i + 1) % outer.length;
+            if (i === io || j === io) continue;
+            if (segProperIntersect(A, B, outer[i], outer[j])) return false;
+        }
+        for (var k = 0; k < hole.length; k++) {
+            var l = (k + 1) % hole.length;
+            if (k === ih || l === ih) continue;
+            if (segProperIntersect(A, B, hole[k], hole[l])) return false;
+        }
+        return true;
+    }
+    // Splice the hole into the outer at a found bridge, doubling the two bridge
+    // endpoints (the keyhole).  isEar's coincident-corner skip handles the
+    // duplicates during ear clipping.
+    function spliceBridge(outer, hole, io, ih) {
+        var res = [];
+        for (var i = 0; i <= io; i++) res.push(outer[i]);
+        for (var k = 0; k < hole.length; k++) res.push(hole[(ih + k) % hole.length]);
+        res.push(hole[ih]);
+        res.push(outer[io]);
+        for (var i = io + 1; i < outer.length; i++) res.push(outer[i]);
+        return res;
+    }
+    function bridgeOneHole(outer, hole) {
+        for (var ih = 0; ih < hole.length; ih++) {
+            for (var io = 0; io < outer.length; io++) {
+                if (bridgeOk(outer, hole, io, ih)) return spliceBridge(outer, hole, io, ih);
+            }
+        }
+        return outer;   // no visible bridge — leave hole un-subtracted (safe)
+    }
+
+    // rings: array of closed polylines ([[x,y],...], already deduped).
+    // Returns an array of simple polygons (outers with their holes bridged in)
+    // ready for earClipTriangulate.  Plain shapes (one ring) pass straight
+    // through; multiple disjoint solids stay separate; deeply-nested rings
+    // that can't be attached fall back to being filled (never dropped).
+    function buildPolygonsWithHoles(rings) {
+        var n = rings.length;
+        if (n <= 1) return rings.slice();
+
+        var area = [];
+        for (var i = 0; i < n; i++) area[i] = ringSignedArea(rings[i]);
+
+        // Immediate parent = smallest ring that contains ring i.
+        var parent = [];
+        for (var i = 0; i < n; i++) {
+            parent[i] = -1;
+            var best = Infinity, testPt = rings[i][0];
+            for (var j = 0; j < n; j++) {
+                if (j === i) continue;
+                if (Math.abs(area[j]) <= Math.abs(area[i])) continue;
+                if (pointInPolygon(testPt, rings[j]) && Math.abs(area[j]) < best) {
+                    best = Math.abs(area[j]); parent[i] = j;
+                }
+            }
+        }
+        // Hole = contained AND wound opposite to its immediate parent.
+        var isHole = [];
+        for (var i = 0; i < n; i++)
+            isHole[i] = parent[i] >= 0 && ringSign(area[i]) !== ringSign(area[parent[i]]);
+
+        var results = [], attached = [];
+        for (var i = 0; i < n; i++) attached[i] = false;
+
+        for (var i = 0; i < n; i++) {
+            if (isHole[i]) continue;
+            var outer = rings[i].slice();
+            if (ringSignedArea(outer) < 0) outer.reverse();          // force CCW
+            var holes = [];
+            for (var h = 0; h < n; h++) {
+                if (isHole[h] && parent[h] === i) {
+                    var hp = rings[h].slice();
+                    if (ringSignedArea(hp) > 0) hp.reverse();         // force CW
+                    holes.push(hp);
+                    attached[h] = true;
+                }
+            }
+            var merged = outer;
+            for (var hh = 0; hh < holes.length; hh++) merged = bridgeOneHole(merged, holes[hh]);
+            results.push(merged);
+        }
+        // Orphan holes (parent is itself a hole — deep nesting like "@"): fill
+        // them as standalone regions so geometry is never lost.
+        for (var i = 0; i < n; i++) {
+            if (isHole[i] && !attached[i]) results.push(rings[i]);
+        }
+        return results;
     }
 
     // Parametric primitive → Path (bezier vertex+tangent form).  Rect with
@@ -1359,8 +1537,10 @@
             var lenN = Math.sqrt(ndx*ndx + ndy*ndy);
             var rPct = (type === 2 && (i % 2 === 1)) ? innRound : outRound;
             var k    = (rPct / 100) * 0.5522847498;
-            inT .push(lenP > 1e-9 ? [(pdx / lenP) * lenP * 0.5 * k, (pdy / lenP) * lenP * 0.5 * k] : [0, 0]);
-            outT.push(lenN > 1e-9 ? [(ndx / lenN) * lenN * 0.5 * k, (ndy / lenN) * lenN * 0.5 * k] : [0, 0]);
+            // tangent = edge_vector * 0.5 * k  (the /len * len cancels; len is
+            // kept only as the degenerate-edge guard).
+            inT .push(lenP > 1e-9 ? [pdx * 0.5 * k, pdy * 0.5 * k] : [0, 0]);
+            outT.push(lenN > 1e-9 ? [ndx * 0.5 * k, ndy * 0.5 * k] : [0, 0]);
         }
         return {
             vertices: verts,
@@ -1740,6 +1920,53 @@
         } catch (e) { return false; }
     }
 
+    // True if any property feeding this layer's SAMPLED transform / camera /
+    // light values is keyframed or expression-driven.  Used to collapse a
+    // fully-static layer to a single sample (perf): the per-frame dedup would
+    // collapse a static layer to one value anyway, so output is byte-identical
+    // — this just skips ~6 valueAtTime calls × frames for layers that never
+    // move.  Conservative: anything we can't read cleanly counts as animated.
+    // Anchor isn't checked — it's baked into the geo, not the matrix.  Parent
+    // animation isn't checked either — a static child's LOCAL transform stays
+    // constant and USD composes the parent's motion.
+    function transformPropAnimated(p) {
+        if (!p) return false;
+        try { if (p.numKeys && p.numKeys > 0) return true; } catch (e) {}
+        try { if (p.expressionEnabled && p.expression && p.expression.length > 0) return true; } catch (e) {}
+        return false;
+    }
+    function isLayerSampleAnimated(layer, nfo) {
+        var probes = [];
+        function add(getter) { try { probes.push(getter()); } catch (e) {} }
+        add(function () { return layer.position; });
+        add(function () { return layer.scale; });
+        add(function () { return layer.orientation; });
+        add(function () { return layer.xRotation; });
+        add(function () { return layer.yRotation; });
+        add(function () { return layer.zRotation; });
+        add(function () { return layer.rotation; });
+        if (nfo.isAV3D)   add(function () { return layer.opacity; });
+        if (nfo.use2Node) add(function () { return layer.pointOfInterest; });
+        if (nfo.isCam) {
+            add(function () { return layer.cameraOption.zoom; });
+            add(function () { return layer.cameraOption.focusDistance; });
+            add(function () { return layer.cameraOption.aperture; });
+            add(function () { return layer.cameraOption.depthOfField; });
+        }
+        if (nfo.isLight) {
+            add(function () { return layer.lightOption.intensity; });
+            add(function () { return layer.lightOption.color; });
+            if (nfo.isSpot) {
+                add(function () { return layer.lightOption.coneAngle; });
+                add(function () { return layer.lightOption.coneFeather; });
+            }
+        }
+        for (var i = 0; i < probes.length; i++) {
+            if (transformPropAnimated(probes[i])) return true;
+        }
+        return false;
+    }
+
     // POI-probe trick — `Layer.fromWorld()` isn't directly callable from
     // ExtendScript, only inside an expression.  For a parented 2-node camera
     // / light we need the camera's pointOfInterest expressed in the parent's
@@ -1895,6 +2122,7 @@
 
     // 10-decimal format with -0 cleanup; trims trailing zeros for compactness.
     function fmt(n) {
+        if (!isFinite(n)) return '0';   // NaN / ±Infinity → 0 (keeps file parseable)
         if (Math.abs(n) < 1e-12) return '0';
         if (Math.abs(n - 1) < 1e-12) return '1';
         if (Math.abs(n + 1) < 1e-12) return '-1';
@@ -2133,22 +2361,44 @@
         if (shouldEmitPath(nfo)) {
             pathProbe = createWorldPathProbe(layer, nfo.primName);
         }
+        // Opacity (AVLayers only) → primvars:displayOpacity / texture-alpha
+        // scale.  Resolve the property once via matchName (works on every
+        // AVLayer subtype); sampled per-frame in the loop below.
+        var opacityProp = null;
+        if (nfo.isAV3D) {
+            try { opacityProp = layer.property("ADBE Transform Group")
+                                     .property("ADBE Opacity"); } catch (e) {}
+        }
 
         // mS[i] = [frame, m00..m22, tx, ty, tz]  (9 rotation + 3 translation values)
         // pathS[i] = [frame, wx, wy, wz]          (cam/light world-space origin)
-        var mS=[], flS=[], fdS=[], intS=[], colS=[], caS=[], cfS=[], pathS=[];
+        var mS=[], flS=[], fdS=[], intS=[], colS=[], caS=[], cfS=[], pathS=[], opS=[], fsS=[];
 
         var sampleLayerLbl = "layer " + (li + 1) + " of " + layerInfos.length +
                              ": " + layer.name;
         progress.update("Sampling transforms…", sampleLayerLbl,
             40 + 50 * (sampleUnitsDone / Math.max(1, totalSampleUnits)));
 
-        for (var frame = startFrame; frame <= endFrame; frame++) {
+        // Fully-static layer with no active probe → one sample is enough; the
+        // write-time dedup collapses static animation to a single value anyway,
+        // so the output is identical while skipping per-frame valueAtTime work.
+        // Probes (POI / path) DO vary with ancestor animation, so keep those
+        // per-frame.
+        var sampleEnd = endFrame;
+        if (!poiProbe && !pathProbe && !isLayerSampleAnimated(layer, nfo)) {
+            sampleEnd = startFrame;
+        }
+
+        for (var frame = startFrame; frame <= sampleEnd; frame++) {
             if (progress.isCancelled()) { sampleCancelled = true; break; }
             var t = frame / fps;
 
-            // Position → USD world translation
-            var rawPos = layer.position.valueAtTime(t, false);
+            // Position → USD world translation.  Guarded: a broken position
+            // expression at this frame must not abort the whole export (it
+            // would escape past endUndoGroup and write no file).
+            var rawPos;
+            try { rawPos = layer.position.valueAtTime(t, false); }
+            catch (ePos) { rawPos = [0, 0, 0]; }
             var tx =  rawPos[0] / scale;
             var ty = -(rawPos.length > 1 ? rawPos[1] : 0) / scale;
             var tz = -(rawPos.length > 2 ? rawPos[2] : 0) / scale;
@@ -2201,6 +2451,10 @@
                     sy = rs.length > 1 ? rs[1] / 100 : sx;
                     sz = rs.length > 2 ? rs[2] / 100 : sy;
                 } catch(e) {}
+                if (opacityProp) {
+                    try { opS.push([frame, opacityProp.valueAtTime(t, false) / 100]); }
+                    catch (eOp) {}
+                }
             }
 
             // Build 3×3 with scale baked in.  USD's xformOp:transform is
@@ -2230,12 +2484,26 @@
 
             // Camera
             if (nfo.isCam) {
-                var zoom = layer.cameraOption.zoom.valueAtTime(t, false);
-                flS.push([frame, FILM_WIDTH_MM * zoom / comp.width * MM_TO_USD]);
+                var zoom = null;
+                try {
+                    zoom = layer.cameraOption.zoom.valueAtTime(t, false);
+                    flS.push([frame, FILM_WIDTH_MM * zoom / comp.width * MM_TO_USD]);
+                } catch (eZoom) {}
                 try {
                     fdS.push([frame,
                         layer.cameraOption.focusDistance.valueAtTime(t, false) / scale]);
                 } catch(e) {}
+                // fStop = focalLength / aperture.  AE gives both in pixels, so
+                // the ratio is unitless — no mm conversion needed.  Gated on the
+                // camera's Depth of Field toggle: fStop = 0 disables DoF in
+                // USD/Karma so a pinhole camera stays sharp (focusDistance alone
+                // is inert without it).
+                try {
+                    var dofOn = layer.cameraOption.depthOfField.valueAtTime(t, false);
+                    var apPx  = layer.cameraOption.aperture.valueAtTime(t, false);
+                    var fst = (dofOn && apPx > 1e-6 && zoom !== null) ? (zoom / apPx) : 0;
+                    fsS.push([frame, fst]);
+                } catch (eDof) {}
             }
 
             // Light
@@ -2245,7 +2513,9 @@
                 // SphereLight in the 100s+ to overcome inverse-square at
                 // typical scene distances.  Scale per type so AE 100% lands
                 // in the right ballpark for each:
-                var aePct = layer.lightOption.intensity.valueAtTime(t, false);
+                var aePct = 100;
+                try { aePct = layer.lightOption.intensity.valueAtTime(t, false); }
+                catch (eInt) {}
                 var inten;
                 switch (nfo.usdType) {
                     case 'DomeLight':    inten = aePct * 0.01; break;  // 100% → 1
@@ -2253,7 +2523,9 @@
                     case 'SphereLight':  inten = aePct * 1.0;  break;  // 100% → 100
                     default:             inten = aePct * 0.01;
                 }
-                var col = layer.lightOption.color.valueAtTime(t, false);
+                var col = [1, 1, 1];
+                try { col = layer.lightOption.color.valueAtTime(t, false); }
+                catch (eCol) {}
                 intS.push([frame, inten]);
                 colS.push([frame, col[0], col[1], col[2]]);
                 if (nfo.isSpot) {
@@ -2270,6 +2542,8 @@
         nfo.mS=mS; nfo.flS=flS; nfo.fdS=fdS;
         nfo.intS=intS; nfo.colS=colS; nfo.caS=caS; nfo.cfS=cfS;
         nfo.pathS = pathS;
+        nfo.opS = opS;
+        nfo.fsS = fsS;
 
         if (poiProbe)  { try { poiProbe.remove();  } catch (e) {} }
         if (pathProbe) { try { pathProbe.remove(); } catch (e) {} }
@@ -2301,12 +2575,15 @@
     out.push(I1 + 'metersPerUnit = 1');
     out.push(I1 + 'framesPerSecond = ' + fps);
     out.push(I1 + 'timeCodesPerSecond = ' + fps);
-    out.push(I1 + 'startTimeCode = ' + startFrame);
-    out.push(I1 + 'endTimeCode = ' + endFrame);
+    out.push(I1 + 'startTimeCode = ' + (startFrame + frameOffset));
+    out.push(I1 + 'endTimeCode = ' + (endFrame + frameOffset));
     out.push(')');
     out.push('');
+    // Strip control chars from comp.name — it lands in a single-line '#'
+    // comment, which has no escape mechanism.
+    var compNameSafe = ('' + comp.name).replace(/[\r\n\t]/g, ' ');
     out.push('# AE to Houdini USD Export');
-    out.push('# Comp: ' + comp.name + '  Frames: ' + startFrame + '-' + endFrame + '  @ ' + fps + ' fps');
+    out.push('# Comp: ' + compNameSafe + '  Frames: ' + (startFrame + frameOffset) + '-' + (endFrame + frameOffset) + '  @ ' + fps + ' fps');
     out.push('# Scale: 1 AE px = ' + (1/scale).toFixed(6) + ' unit' +
              '  Aperture: ' + apertureH.toFixed(4) + ' x ' + apertureV.toFixed(4) + ' mm');
     out.push('');
@@ -2362,11 +2639,32 @@
     // char, mangling anything above U+007F (e.g. U+00B7 "·" → raw byte 0xB7,
     // invalid UTF-8). Hand-encode to UTF-8 so AE layer names with accents,
     // umlauts, CJK etc. parse cleanly in USD/Houdini.
+    if (progress.isCancelled()) {
+        progress.close();
+        alert("Export cancelled — no USD file was written.");
+        return;
+    }
     progress.update("Writing USD file…", outPath, 96);
     outFile.encoding = "binary";
-    outFile.open("w");
-    outFile.write(toUtf8Bytes(content));
+    // Guard the write: a failed open (read-only volume, permission denied,
+    // parent folder gone) or short write (disk full) must NOT fall through to
+    // the "Export complete" dialog — that would report success over a missing
+    // or truncated file, especially dangerous since the AE project may already
+    // be mutated (backup / 2D→3D / shape split) by this point.
+    if (!outFile.open("w")) {
+        progress.close();
+        alert("Could not open output file for writing:\n" + outPath +
+              (outFile.error ? "\n\n" + outFile.error : ""));
+        return;
+    }
+    var wroteOk = outFile.write(toUtf8Bytes(content));
     outFile.close();
+    if (!wroteOk) {
+        progress.close();
+        alert("Write failed — disk full or file locked?\n" + outPath +
+              (outFile.error ? "\n\n" + outFile.error : ""));
+        return;
+    }
     progress.update("Done", outPath, 100);
     progress.close();
 
@@ -2455,6 +2753,15 @@
             out.push(ind2 + 'float verticalApertureOffset = 0');
             writeScalar(out, ind2, 'float', 'focalLength',   nfo.flS);
             if (nfo.fdS.length) writeScalar(out, ind2, 'float', 'focusDistance', nfo.fdS);
+            // fStop only when Depth of Field is actually engaged on some frame
+            // (all-zero samples mean DoF off → leave USD's default pinhole).
+            if (nfo.fsS && nfo.fsS.length) {
+                var anyFs = false;
+                for (var qf = 0; qf < nfo.fsS.length; qf++) {
+                    if (nfo.fsS[qf][1] > 0) { anyFs = true; break; }
+                }
+                if (anyFs) writeScalar(out, ind2, 'float', 'fStop', nfo.fsS);
+            }
         }
 
         if (nfo.isLight) {
@@ -2508,6 +2815,43 @@
         out.push(ind + '}');
     }
 
+    // Emit float[] primvars:displayOpacity from per-frame opacity samples
+    // (opS rows: [frame, 0..1]).  Companion to displayColor for Hydra's
+    // fallback shading.  Skips entirely when the layer is fully opaque;
+    // static < 1 → one constant value, animated → held-run deduped
+    // timeSamples (same pattern as the transform / colour writers).
+    function writeDisplayOpacity(arr, ind, opS) {
+        if (!opS || !opS.length) return;
+        if (isStaticSamples(opS, 1)) {
+            if (opS[0][1] >= 0.999999) return;   // fully opaque → nothing to author
+            arr.push(ind + 'float[] primvars:displayOpacity = [' + fmt6(opS[0][1]) + ']');
+            return;
+        }
+        var keys = dedupSamples(opS, 1);
+        arr.push(ind + 'float[] primvars:displayOpacity.timeSamples = {');
+        for (var i = 0; i < keys.length; i++)
+            arr.push(ind + '    ' + (keys[i][0] + frameOffset) + ': [' + fmt6(keys[i][1]) + '],');
+        arr.push(ind + '}');
+    }
+
+    // Fold AE layer opacity into a footage texture's sampled alpha.
+    // UsdUVTexture computes out = raw*scale + bias, so scale.a multiplies
+    // the alpha that feeds UsdPreviewSurface inputs:opacity.  No-op when
+    // fully opaque; static or timeSampled like writeDisplayOpacity.
+    function writeTexAlphaScale(arr, ind, opS) {
+        if (!opS || !opS.length) return;
+        if (isStaticSamples(opS, 1)) {
+            if (opS[0][1] >= 0.999999) return;
+            arr.push(ind + 'float4 inputs:scale = (1, 1, 1, ' + fmt6(opS[0][1]) + ')');
+            return;
+        }
+        var keys = dedupSamples(opS, 1);
+        arr.push(ind + 'float4 inputs:scale.timeSamples = {');
+        for (var i = 0; i < keys.length; i++)
+            arr.push(ind + '    ' + (keys[i][0] + frameOffset) + ': (1, 1, 1, ' + fmt6(keys[i][1]) + '),');
+        arr.push(ind + '}');
+    }
+
     function writeSolidGeo(arr, ind, nfo) {
         // FootageItem.width/height for dimensions; SolidSource (mainSource)
         // owns the colour.
@@ -2541,6 +2885,7 @@
         arr.push(ind2 + 'bool doubleSided = 1');
         arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
             fmt(c[0]) + ', ' + fmt(c[1]) + ', ' + fmt(c[2]) + ')]');
+        writeDisplayOpacity(arr, ind2, nfo.opS);
         arr.push(ind + '}');
     }
 
@@ -2584,9 +2929,10 @@
         arr.push(ind3 + 'interpolation = "vertex"');
         arr.push(ind2 + ')');
         if (assetPath) {
-            arr.push(ind2 + 'rel material:binding = <mat>');
+            arr.push(ind2 + 'rel material:binding = <../mat>');
         } else {
             arr.push(ind2 + 'color3f[] primvars:displayColor = [(0.5, 0.5, 0.5)]');
+            writeDisplayOpacity(arr, ind2, nfo.opS);
         }
         arr.push(ind + '}');
 
@@ -2610,7 +2956,12 @@
         arr.push(ind2 + 'def Shader "Tex"');
         arr.push(ind2 + '{');
         arr.push(ind3 + 'uniform token info:id = "UsdUVTexture"');
-        arr.push(ind3 + 'asset inputs:file = @' + assetPath + '@');
+        // Triple-delimiter form when the path itself contains '@' (USD asset
+        // literals can't hold a bare '@' between single '@' delimiters).
+        var fileTok = (assetPath.indexOf('@') >= 0)
+            ? ('@@@' + assetPath + '@@@') : ('@' + assetPath + '@');
+        arr.push(ind3 + 'asset inputs:file = ' + fileTok);
+        writeTexAlphaScale(arr, ind3, nfo.opS);
         arr.push(ind3 + 'float2 inputs:st.connect = <../PrimvarReader.outputs:result>');
         arr.push(ind3 + 'float3 outputs:rgb');
         arr.push(ind3 + 'float outputs:a');
@@ -2619,7 +2970,7 @@
         arr.push(ind2 + 'def Shader "PrimvarReader"');
         arr.push(ind2 + '{');
         arr.push(ind3 + 'uniform token info:id = "UsdPrimvarReader_float2"');
-        arr.push(ind3 + 'token inputs:varname = "st"');
+        arr.push(ind3 + 'string inputs:varname = "st"');
         arr.push(ind3 + 'float2 outputs:result');
         arr.push(ind2 + '}');
         arr.push(ind + '}');
@@ -2656,6 +3007,7 @@
         arr.push(ind2 + 'bool doubleSided = 1');
         arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
             fmt(c[0]) + ', ' + fmt(c[1]) + ', ' + fmt(c[2]) + ')]');
+        writeDisplayOpacity(arr, ind2, nfo.opS);
         arr.push(ind + '}');
     }
 
@@ -2667,29 +3019,50 @@
         var displayColor = [0.5, 0.5, 0.5], foundColor = false;
         var vertCount = 0;
 
+        // Collect valid rings (deduped) and the first fill colour.  Hole
+        // subtraction needs all rings together, so we gather first, classify,
+        // then triangulate — instead of triangulating each path in isolation.
+        var rings = [];
         for (var pi = 0; pi < paths.length; pi++) {
             var p = paths[pi];
             if (!p.poly) continue;
             var poly = dedupAdjacent(p.poly);
             if (poly.length < 3) continue;
-            var tris = earClipTriangulate(poly);
+            rings.push(poly);
+            if (!foundColor && p.color) {
+                displayColor = [p.color[0], p.color[1], p.color[2]];
+                foundColor = true;
+            }
+        }
+        if (!rings.length) return null;
+
+        // Bridge holes into their outer rings (letter "O", "8", donuts), then
+        // ear-clip each resulting simple polygon.
+        var polys = buildPolygonsWithHoles(rings);
+        for (var qi = 0; qi < polys.length; qi++) {
+            var mpoly = polys[qi];
+            if (mpoly.length < 3) continue;
+            var tris = earClipTriangulate(mpoly);
             if (!tris.length) continue;
             var startIdx = vertCount;
-            for (var v = 0; v < poly.length; v++) {
-                var ux = (poly[v][0] - anchor[0]) / scale;
-                var uy = -(poly[v][1] - anchor[1]) / scale;
+            for (var v = 0; v < mpoly.length; v++) {
+                var ux = (mpoly[v][0] - anchor[0]) / scale;
+                var uy = -(mpoly[v][1] - anchor[1]) / scale;
                 pointStrs.push('(' + fmt(ux) + ', ' + fmt(uy) + ', 0)');
                 vertCount++;
             }
             for (var ti = 0; ti < tris.length; ti++) {
+                var ta = mpoly[tris[ti][0]], tb = mpoly[tris[ti][1]], tc = mpoly[tris[ti][2]];
+                // Drop degenerate slivers so USD doesn't get NaN normals.
+                var dblArea = (tb[0]-ta[0])*(tc[1]-ta[1]) - (tc[0]-ta[0])*(tb[1]-ta[1]);
+                if (Math.abs(dblArea) < 1e-9) continue;
                 faceCounts.push(3);
+                // Reverse winding (0,2,1): the Y-flip when emitting points
+                // mirrors the CCW ear-clip result to CW; reversing restores
+                // front-facing (+Z) winding, matching the solid/footage quads.
                 faceIndices.push(startIdx + tris[ti][0]);
-                faceIndices.push(startIdx + tris[ti][1]);
                 faceIndices.push(startIdx + tris[ti][2]);
-            }
-            if (!foundColor && p.color) {
-                displayColor = [p.color[0], p.color[1], p.color[2]];
-                foundColor = true;
+                faceIndices.push(startIdx + tris[ti][1]);
             }
         }
         if (!pointStrs.length) return null;
@@ -2722,6 +3095,7 @@
         arr.push(ind2 + 'bool doubleSided = 1');
         arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
             fmt(snap.displayColor[0]) + ', ' + fmt(snap.displayColor[1]) + ', ' + fmt(snap.displayColor[2]) + ')]');
+        writeDisplayOpacity(arr, ind2, nfo.opS);
         arr.push(ind + '}');
         return true;
     }
@@ -2804,7 +3178,7 @@
         if (topoConstant) {
             arr.push(ind2 + 'point3f[] points.timeSamples = {');
             for (var ki = 0; ki < keys.length; ki++) {
-                arr.push(ind2 + '    ' + keys[ki].frame + ': [' + keys[ki].snap.pointStrs.join(', ') + '],');
+                arr.push(ind2 + '    ' + (keys[ki].frame + frameOffset) + ': [' + keys[ki].snap.pointStrs.join(', ') + '],');
             }
             arr.push(ind2 + '}');
             arr.push(ind2 + 'int[] faceVertexCounts = [' + first.faceCounts.join(', ') + ']');
@@ -2812,23 +3186,24 @@
         } else {
             arr.push(ind2 + 'point3f[] points.timeSamples = {');
             for (var ki2 = 0; ki2 < keys.length; ki2++) {
-                arr.push(ind2 + '    ' + keys[ki2].frame + ': [' + keys[ki2].snap.pointStrs.join(', ') + '],');
+                arr.push(ind2 + '    ' + (keys[ki2].frame + frameOffset) + ': [' + keys[ki2].snap.pointStrs.join(', ') + '],');
             }
             arr.push(ind2 + '}');
             arr.push(ind2 + 'int[] faceVertexCounts.timeSamples = {');
             for (var ki3 = 0; ki3 < keys.length; ki3++) {
-                arr.push(ind2 + '    ' + keys[ki3].frame + ': [' + keys[ki3].snap.faceCounts.join(', ') + '],');
+                arr.push(ind2 + '    ' + (keys[ki3].frame + frameOffset) + ': [' + keys[ki3].snap.faceCounts.join(', ') + '],');
             }
             arr.push(ind2 + '}');
             arr.push(ind2 + 'int[] faceVertexIndices.timeSamples = {');
             for (var ki4 = 0; ki4 < keys.length; ki4++) {
-                arr.push(ind2 + '    ' + keys[ki4].frame + ': [' + keys[ki4].snap.faceIndices.join(', ') + '],');
+                arr.push(ind2 + '    ' + (keys[ki4].frame + frameOffset) + ': [' + keys[ki4].snap.faceIndices.join(', ') + '],');
             }
             arr.push(ind2 + '}');
         }
         arr.push(ind2 + 'bool doubleSided = 1');
         arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
             fmt(displayColor[0]) + ', ' + fmt(displayColor[1]) + ', ' + fmt(displayColor[2]) + ')]');
+        writeDisplayOpacity(arr, ind2, nfo.opS);
         arr.push(ind + '}');
         return true;
     }
@@ -2838,7 +3213,7 @@
     // per-frame extraction and time-sampled mesh data; static text falls
     // through to the cheap single-snapshot path.  Last-resort fallback:
     // bounding-box quad coloured with the text's fill colour.
-    // Polygons-with-holes (letter "O") render filled as a v1 limit.
+    // Counters (letter "O", "8") are subtracted — see buildPolygonsWithHoles.
     function writeTextGeo(arr, ind, nfo) {
         if (nfo.extractedPathsByFrame && nfo.extractedPathsByFrame.length) {
             if (writeAnimatedVectorMesh(arr, ind, nfo, nfo.extractedPathsByFrame)) return;
@@ -2950,6 +3325,7 @@
         arr.push(ind2 + ')');
         arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
             fmt(displayColor[0]) + ', ' + fmt(displayColor[1]) + ', ' + fmt(displayColor[2]) + ')]');
+        writeDisplayOpacity(arr, ind2, nfo.opS);
         arr.push(ind + '}');
         return true;
     }
@@ -3013,7 +3389,8 @@
             }
         }
 
-        arr.push(ind + 'def BasisCurves "' + nfo.primName + '_path" (');
+        var pathName = makePrimName(nfo.primName + '_path', usedPrimNames);
+        arr.push(ind + 'def BasisCurves "' + pathName + '" (');
         arr.push(ind2 + 'doc = "' + esc(nfo.layer.name) + '  [' + label + ']"');
         arr.push(ind + ')');
         arr.push(ind + '{');
@@ -3059,13 +3436,13 @@
         // their value until the next sample, so two or three keys are enough.
         arr.push(ind + 'token visibility.timeSamples = {');
         if (enters) {
-            arr.push(ind + '    ' + startFrame + ': "invisible",');
-            arr.push(ind + '    ' + inFrame    + ': "inherited",');
+            arr.push(ind + '    ' + (startFrame + frameOffset) + ': "invisible",');
+            arr.push(ind + '    ' + (inFrame    + frameOffset) + ': "inherited",');
         } else {
-            arr.push(ind + '    ' + startFrame + ': "inherited",');
+            arr.push(ind + '    ' + (startFrame + frameOffset) + ': "inherited",');
         }
         if (exits) {
-            arr.push(ind + '    ' + (outFrame + 1) + ': "invisible",');
+            arr.push(ind + '    ' + (outFrame + 1 + frameOffset) + ': "invisible",');
         }
         arr.push(ind + '}');
     }
@@ -3144,7 +3521,7 @@
             var keys = dedupSamples(samples, 12);
             arr.push(ind + 'matrix4d xformOp:transform.timeSamples = {');
             for (var i = 0; i < keys.length; i++) {
-                arr.push(ind + '    ' + keys[i][0] + ': ' + rowStr(keys[i]) + ',');
+                arr.push(ind + '    ' + (keys[i][0] + frameOffset) + ': ' + rowStr(keys[i]) + ',');
             }
             arr.push(ind + '}');
             opName = 'xformOp:transform';
@@ -3160,7 +3537,7 @@
             var keys = dedupSamples(samples, 1);
             arr.push(ind + type + ' ' + name + '.timeSamples = {');
             for (var i = 0; i < keys.length; i++)
-                arr.push(ind + '    ' + keys[i][0] + ': ' + fmt6(keys[i][1]) + ',');
+                arr.push(ind + '    ' + (keys[i][0] + frameOffset) + ': ' + fmt6(keys[i][1]) + ',');
             arr.push(ind + '}');
         }
     }
@@ -3176,19 +3553,24 @@
             var keys = dedupSamples(samples, 3);
             arr.push(ind + type + ' ' + name + '.timeSamples = {');
             for (var i = 0; i < keys.length; i++)
-                arr.push(ind + '    ' + keys[i][0] + ': ' + tupleStr(keys[i]) + ',');
+                arr.push(ind + '    ' + (keys[i][0] + frameOffset) + ': ' + tupleStr(keys[i]) + ',');
             arr.push(ind + '}');
         }
     }
 
     // 6-decimal format with -0 cleanup for camera/light/colour values.
     function fmt6(n) {
+        if (!isFinite(n)) return '0';   // NaN / ±Infinity → 0 (keeps file parseable)
         if (Math.abs(n) < 1e-9) return '0';
         return (+n.toFixed(6)).toString();
     }
 
     function esc(s) {
-        return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+        // Escape backslash and quote first, then control chars — a literal
+        // newline/CR/tab in a layer name would otherwise split a doc string
+        // across lines and make the entire .usda unparseable.
+        return s.replace(/\\/g, '\\\\').replace(/"/g, '\\"')
+                .replace(/\n/g, '\\n').replace(/\r/g, '\\r').replace(/\t/g, '\\t');
     }
 
     // UCS-2 JS string → UTF-8 byte string (each char's low byte == one UTF-8
