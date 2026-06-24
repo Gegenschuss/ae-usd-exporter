@@ -140,7 +140,7 @@ Vertical aperture divides by `comp.pixelAspect` (`apertureV = FILM_WIDTH_MM · h
 
 ## Build version
 
-Bump `BUILD_DATE` (YYMMDD format with optional letter suffix) at the top of the script on each meaningful change. Shown in the dialog title. Current build: `260429bb`.
+Bump `BUILD_DATE` (YYMMDD format with optional letter suffix) at the top of the script on each meaningful change. Shown in the dialog title. Current build: `260429bc`.
 
 ## What's verified vs not
 
@@ -169,12 +169,16 @@ End-to-end against AE preview:
 
 Verified by standalone geometry tests (pure math, no AE — see "Verifying triangulation"):
 - ✅ Polygon hole subtraction (counters in O / 8 / donuts) — `buildPolygonsWithHoles` classifies rings by containment + winding and bridges each hole into its outer with a keyhole edge; the existing ear-clipper then subtracts the hole.  Validated for correct net area and zero triangles inside holes.
+- ✅ Multi-colour fills → one sub-Mesh per distinct colour (`groupPathsByColor`) — verified that a red "O" still subtracts its counter while a differently-coloured shape stays a separate filled mesh.
+- ✅ Trim Paths (`trimPolyline`) — arc-length trim verified for open / closed / offset / wrap / corner-preservation.
+- ✅ `toUtf8Bytes` rewrite — byte-identical to the old encoder vs reference + 2000 fuzz inputs (incl. surrogate pairs / lone surrogates).
 
-Implemented but NOT yet AE-smoke-tested (build 260429ax–bb; math-correct + additive — confirm in a real export, ideally diffing against a frame-0-start baseline):
+Implemented but NOT yet AE-smoke-tested (build 260429ax–bc; math-correct + additive — confirm in a real export, ideally diffing against a frame-0-start baseline):
 - ⚠️ Layer opacity → `primvars:displayOpacity` (all geo writers); textured footage folds opacity into the `UsdUVTexture` alpha scale.
 - ⚠️ Camera `fStop` (= zoom / aperture) gated on `depthOfField`; anamorphic vertical aperture (÷ pixelAspect).
 - ⚠️ `comp.displayStartTime` → every emitted frame label / timeCode shifted by `frameOffset` (0 for frame-0 comps → identical output).
 - ⚠️ Static-layer single-sample optimisation (`isLayerSampleAnimated`) — output identical after dedup; confirm animated layers still move and static ones don't freeze.
+- ⚠️ Layer comment + markers → `customData`; per-path stroke widths; `purpose="guide"` on path curves; unsupported-feature preflight; `ensureBackup` save-verification; probe sweep.  All additive — confirm the preflight dialog reads well and markers/comments land in `customData`.
 
 Not yet visually verified:
 - ⚠️ All four light types (data is exported, framing/falloff in Houdini not confirmed)
@@ -205,19 +209,24 @@ Done since first release (kept here so future sessions don't re-litigate solved 
 - ✅ **Camera fStop + DoF (260429az)** — see "Depth of field + anamorphic aperture" above.
 - ✅ **Polygon hole subtraction (260429ba)** — `buildPolygonsWithHoles` (ring classification by containment + winding, keyhole bridges) feeds the ear-clipper one simple polygon per outer.  `isEar` skips vertices coincident with a triangle corner so the bridge duplicates don't stall the clip.  Rejected even-odd (USD Mesh has no fill rule); deep nesting ("@") falls back to filled so geometry is never dropped.  Validated by the Node geometry harness.
 - ✅ **Polish + perf sweep (260429bb)** — `comp.displayStartTime` → `frameOffset` on every emitted frame label / timeCode; sub-prim name collisions reserved (`geo`/`mat`/`stroke`; `<name>_path` routed through `makePrimName`); dialog numeric validation (reject NaN / ≤0 / far≤near before close, store parsed prefs) + `defaultElement = btnSave`; triangulated-mesh winding reversed to front-facing (matches the quads); degenerate-triangle filter; anamorphic aperture ÷ pixelAspect; `@`-in-texture-path triple-delimiter; header `comp.name` control-char strip; static-layer single-sample (`isLayerSampleAnimated`); cancel-check before write; dead-code cleanups (empty reverse-walk loop, `makeStarShape` `(d/len)·len` cancellation).
+- ✅ **Robustness + features sweep (260429bc)** —
+  - `ensureBackup` verifies the Increment-and-Save actually ran (project path changed) before trusting it; else falls through to the copy.
+  - `toUtf8Bytes` rebuilt as array-push + single `join` with ASCII-run batching (was O(n²)); **byte-identical** to the old output (verified vs reference + 2000 fuzz inputs incl. surrogates).
+  - `sweepStaleProbes()` removes leftover `_AE2USD_*` probe nulls from a prior crashed run (self-healing) at the start of the sampling phase.
+  - Parented 2-node POI fallback: when the probe fails, fall back to orientation-only instead of mixing parent-local pos with world POI.
+  - Stroke width is now **per-path** (USD `widths` per-vertex), not last-seen-wins.
+  - **Multi-colour fills** → one sub-Mesh per distinct fill colour (`groupPathsByColor`); a glyph's outer+counter share a colour so holes still subtract.  Node-verified.
+  - **Trim Paths** (`ADBE Vector Filter - Trim`): Start/End/Offset trim of the tessellated polyline by arc length (`trimPolyline`), open + closed + wrap.  Per-path (Simultaneously); animated trim is caught by `isShapeAnimated`.  Node-verified.  A trimmed path emits as an open arc.
+  - `uniform token purpose = "guide"` on the animation-path `BasisCurves` so trajectories don't render in finals.
+  - Layer **comment + markers → `customData`** (`ae:comment`; markers as parallel `ae:markerFrames` / `ae:markerNames`, since customData has no timeSamples).
+  - **Unsupported-feature preflight** (`warnUnsupportedFeatures`): a non-blocking confirm listing layers with masks / track mattes / non-Normal blend modes / effects.
 
 Still pending:
 
 - **Light visual verification in Houdini/Karma.**  ⭐ The #1 item.  All four types export data; per-type intensity tuning (Sphere × 1.0, Distant × 0.05, Dome × 0.01, plus `inputs:normalize = 1` and `radius = 0.1` for SphereLight) is the current convention. Needs a render-comparison sweep: AE preview vs Houdini render, all four types.
 - **X/Y/Z Rotation order (`Mi`) is `Z*Y*X`, untested.** All test cameras have zero individual X/Y/Z Rotations. If a `~2°` drift appears on cameras/nulls with non-zero values, suspect this Euler order next and run the probe trick.
-- **Vector geometry edge cases.**  Currently skipped: Trim Paths, Merge Paths, Repeater, Wiggle Paths, Pucker & Bloat, Twist.  (Hole subtraction now shipped.)  All graceful — fall back to bbox quad when no paths could be extracted.
-- **`ensureBackup()` doesn't verify the save happened** — `executeCommand("Increment and Save")` returns void; on read-only media / full disk it silently no-ops, `didBackup` sticks true, and later destructive phases run unprotected. Snapshot `app.project.file.fsName` before/after; fall back to the copy path if unchanged.
-- **`toUtf8Bytes` is O(n²)** — char-by-char `+=` on the whole document; dominates large animated writes. Build into an array and `join`, or slice ASCII runs and hand-encode only multibyte chars.
-- **Multi-colour fills flatten to first `displayColor`** — overlapping coplanar fills z-fight. One sub-Mesh per distinct colour (mirrors stroke-as-sibling-BasisCurves).
-- **Stroke BasisCurves applies last-seen width to all paths** — track per-path width.
-- **Parented 2-node POI fallback** mixes parent-local position with world POI on probe-creation failure (aims the camera wrong) — fall back to `aeRotMatrix`-only or abort the layer.
-- **Probe nulls leak on a mid-loop throw** (removal only runs at iteration end) — add a startup sweep that removes any stale `_AE2USD_*` layers, making it self-healing.
-- **Roadmap features** (impact-ordered): `uniform token purpose = "guide"` on path curves + bbox fallbacks; markers / layer comments → `customData`; Houdini-side import HDA/LOP (sublayer + viewport camera + guide toggle); multi-comp / batch export (refactor core into `exportComp(comp, file, opts)`); references / payloads / variants; preflight warning for masks / track mattes / non-Normal blend modes / effects (+ document those, motion blur, audio, PBR as explicit non-goals).
+- **Vector geometry edge cases.**  Still skipped: Merge Paths, Repeater, Wiggle Paths, Pucker & Bloat, Twist.  (Hole subtraction + Trim Paths now shipped.)  All graceful — fall back to bbox quad when no paths could be extracted.  Merge Paths needs robust polygon boolean ops; Repeater is a duplicate-with-incremental-transform; the deformers (Wiggle/Pucker/Twist) are per-vertex displacers (Wiggle is time-random — won't match AE exactly).
+- **Roadmap features** (impact-ordered, not yet started): Houdini-side import HDA/LOP (sublayer + viewport camera + guide toggle) — highest net-new value, but needs Houdini to author/test; multi-comp / batch export (refactor core into `exportComp(comp, file, opts)` — large, high untested-regression risk); references / payloads / variants (architectural — needs design + AE testing).
 
 ### How to resume a session
 

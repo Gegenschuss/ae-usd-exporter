@@ -123,9 +123,18 @@
         try {
             var cmdId = app.findMenuCommandId("Increment and Save");
             if (cmdId) {
+                // executeCommand returns void; "Increment and Save" makes the
+                // incremented file the active project, so a CHANGED project path
+                // is our proof it actually ran.  If unchanged (read-only media,
+                // full disk, or a non-English menu name that didn't match) fall
+                // through to the manual copy instead of falsely reporting success.
+                var before = app.project.file ? app.project.file.fsName : null;
                 app.executeCommand(cmdId);
-                didBackup = true;
-                return true;
+                var after = app.project.file ? app.project.file.fsName : null;
+                if (after && after !== before) {
+                    didBackup = true;
+                    return true;
+                }
             }
         } catch (e) {}
         // Fallback: copy the .aep with a timestamp suffix
@@ -147,7 +156,7 @@
     }
 
     // ── Dialog ────────────────────────────────────────────────────────────
-    var BUILD_DATE = "260429bb";  // bump on each meaningful change (YYMMDD)
+    var BUILD_DATE = "260429bc";  // bump on each meaningful change (YYMMDD)
     var dlg = new Window("dialog", "AE → Houdini USD Exporter");
     dlg.orientation = "column";
     dlg.alignChildren = ["fill", "top"];
@@ -1640,6 +1649,81 @@
         return out;
     }
 
+    // Trim Paths operator ("ADBE Vector Filter - Trim").  Start/End are
+    // percentages of path length, Offset is degrees (360 = one full loop).
+    // Returns null for a full-path no-op so geometry is left untouched.
+    function readTrimParams(trimProp, time) {
+        var start = 0, end = 100, offset = 0;
+        try { start  = trimProp.property("ADBE Vector Trim Start") .valueAtTime(time, false); } catch (e) {}
+        try { end    = trimProp.property("ADBE Vector Trim End")   .valueAtTime(time, false); } catch (e) {}
+        try { offset = trimProp.property("ADBE Vector Trim Offset").valueAtTime(time, false); } catch (e) {}
+        if (start <= 1e-4 && end >= 100 - 1e-4 && Math.abs(offset) < 1e-4) return null;
+        return { start: start, end: end, offset: offset };
+    }
+
+    // Trim a tessellated polyline by arc length.  Returns null = whole path
+    // (no effective trim), [] = trimmed to nothing, else an OPEN trimmed arc.
+    // Verified standalone against open / closed / offset / wrap / corner cases.
+    function trimPolyline(poly, startPct, endPct, offsetDeg, closed) {
+        var n = poly.length;
+        if (n < 2) return null;
+        var pts = poly.slice();
+        if (closed) pts.push(poly[0]);          // include the closing segment
+        var seg = [], cum = [0], total = 0;
+        for (var i = 0; i < pts.length - 1; i++) {
+            var dx = pts[i+1][0]-pts[i][0], dy = pts[i+1][1]-pts[i][1];
+            var L = Math.sqrt(dx*dx+dy*dy); seg.push(L); total += L; cum.push(total);
+        }
+        if (total < 1e-9) return null;
+
+        var off = (offsetDeg || 0) / 360;
+        var a = (startPct/100) + off, b = (endPct/100) + off;
+        var spanFrac = b - a;
+        if (spanFrac <= 1e-9) return [];            // start >= end → nothing
+        if (spanFrac >= 1 - 1e-9) return null;      // whole path
+
+        var len0, len1;
+        if (closed) {
+            len0 = (a - Math.floor(a)) * total;     // normalise start into [0,total)
+            len1 = len0 + spanFrac * total;         // may exceed total (wraps)
+        } else {
+            var ca = a < 0 ? 0 : (a > 1 ? 1 : a);
+            var cb = b < 0 ? 0 : (b > 1 ? 1 : b);
+            if (cb - ca <= 1e-9) return [];
+            len0 = ca * total; len1 = cb * total;
+        }
+
+        function ptAt(s) {
+            if (closed) { s = s % total; if (s < 0) s += total; }
+            else { if (s < 0) s = 0; if (s > total) s = total; }
+            for (var k = 0; k < seg.length; k++) {
+                if (s <= cum[k+1] + 1e-9 || k === seg.length - 1) {
+                    var t = seg[k] > 1e-12 ? (s - cum[k]) / seg[k] : 0;
+                    if (t < 0) t = 0; if (t > 1) t = 1;
+                    return [pts[k][0] + (pts[k+1][0]-pts[k][0])*t,
+                            pts[k][1] + (pts[k+1][1]-pts[k][1])*t];
+                }
+            }
+            return pts[pts.length-1];
+        }
+
+        var result = [ptAt(len0)];
+        if (!closed) {
+            for (var i = 0; i < cum.length; i++) {
+                if (cum[i] > len0 + 1e-6 && cum[i] < len1 - 1e-6) result.push(pts[i]);
+            }
+        } else {
+            for (var rep = 0; rep <= 1; rep++) {
+                for (var i = 0; i < cum.length - 1; i++) {   // skip duplicate closing vertex
+                    var pos = cum[i] + rep * total;
+                    if (pos > len0 + 1e-6 && pos < len1 - 1e-6) result.push(pts[i]);
+                }
+            }
+        }
+        result.push(ptAt(len1));
+        return result;
+    }
+
     function walkVectorGroup(groupProp, parentXform, parentRender, out, time) {
         // First pass: pick up the local Transform Group (if any) and any
         // Fill / Stroke (so nested shapes inherit them).  Fill wins over
@@ -1651,6 +1735,7 @@
         var strokeColor = parentRender.strokeColor;
         var hasStroke   = parentRender.hasStroke;
         var strokeWidth = parentRender.strokeWidth;
+        var trim        = null;   // Trim Paths in this group (applies to its shapes)
         for (var i = 1; i <= groupProp.numProperties; i++) {
             var p;
             try { p = groupProp.property(i); } catch (e) { continue; }
@@ -1667,6 +1752,8 @@
                 if (sc) { strokeColor = [sc[0], sc[1], sc[2]]; hasStroke = true; }
                 var sw = findStrokeWidthValue(p, time);
                 if (sw != null) strokeWidth = sw;
+            } else if (mn === "ADBE Vector Filter - Trim") {
+                trim = readTrimParams(p, time);
             }
         }
         var fullXform = m3x3mul(parentXform, localXform);
@@ -1680,10 +1767,18 @@
         var pathColor = hasFill ? fillColor : (hasStroke ? strokeColor : [0.5, 0.5, 0.5]);
 
         function pushPath(poly, closed) {
+            var emitClosed = closed;
+            if (trim) {
+                var tp = trimPolyline(poly, trim.start, trim.end, trim.offset, closed);
+                if (tp !== null) {
+                    if (tp.length < 2) return;       // trimmed away → emit nothing
+                    poly = tp; emitClosed = false;   // a trimmed path is an open arc
+                }
+            }
             out.push({
                 poly:        poly,
                 color:       pathColor,
-                closed:      closed,
+                closed:      emitClosed,
                 hasFill:     hasFill,
                 hasStroke:   hasStroke,
                 strokeColor: strokeColor,
@@ -2024,6 +2119,30 @@
         return n;
     }
 
+    // Remove any probe nulls left behind by a previous crashed / interrupted
+    // run.  A normal run removes its own (named "_AE2USD_*"), but a throw
+    // between create and remove could leak one; sweeping at startup makes the
+    // tool self-healing so they never accumulate across runs.
+    function sweepStaleProbes() {
+        try {
+            app.beginUndoGroup("AE USD Exporter — sweep stale probes");
+            var items = app.project.items;
+            for (var ii = 1; ii <= items.length; ii++) {
+                var it;
+                try { it = items[ii]; } catch (e) { continue; }
+                if (!it || !(it instanceof CompItem)) continue;
+                for (var pl = it.numLayers; pl >= 1; pl--) {
+                    var ly;
+                    try { ly = it.layer(pl); } catch (e) { continue; }
+                    if (ly && ly.name && ly.name.indexOf("_AE2USD_") === 0) {
+                        try { ly.remove(); } catch (e) {}
+                    }
+                }
+            }
+            app.endUndoGroup();
+        } catch (e) {}
+    }
+
     function readRot(layer, t) {
         var ori=[0,0,0], xr=0, yr=0, zr=0;
         try { ori = layer.orientation.valueAtTime(t, false); } catch(e) {}
@@ -2043,6 +2162,32 @@
     function is2NodeCamera(layer) {
         try { return layer.autoOrient === AutoOrientType.CAMERA_OR_POINT_OF_INTEREST; }
         catch(e) { return false; }
+    }
+
+    // Advisory scan for AE features the exporter doesn't represent (masks,
+    // track mattes, non-Normal blend modes, effects).  Returns true to proceed
+    // (default), false if the user cancels.  Purely informational — the geometry
+    // / transform / base-colour export is unaffected by these features.
+    function warnUnsupportedFeatures(infos) {
+        var masks = 0, mattes = 0, blends = 0, fx = 0;
+        for (var wi = 0; wi < infos.length; wi++) {
+            var wl = infos[wi].layer;
+            try { var mp = wl.property("ADBE Mask Parade"); if (mp && mp.numProperties > 0) masks++; } catch (e) {}
+            try { if (wl.trackMatteType && wl.trackMatteType !== TrackMatteType.NO_TRACK_MATTE) mattes++; } catch (e) {}
+            try { if (wl.blendingMode && wl.blendingMode !== BlendingMode.NORMAL) blends++; } catch (e) {}
+            try { var ep = wl.property("ADBE Effect Parade"); if (ep && ep.numProperties > 0) fx++; } catch (e) {}
+        }
+        if (!(masks || mattes || blends || fx)) return true;
+        var parts = [];
+        if (masks)  parts.push("• " + masks  + " with masks");
+        if (mattes) parts.push("• " + mattes + " with track mattes");
+        if (blends) parts.push("• " + blends + " with non-Normal blend modes");
+        if (fx)     parts.push("• " + fx     + " with effects");
+        return confirm(
+            "Heads up — these AE features are NOT exported to USD:\n\n" +
+            parts.join("\n") +
+            "\n\nGeometry, transforms, visibility and base colours still export.\n\nContinue?",
+            false);
     }
 
     // Progress palette — non-blocking ScriptUI window with status line,
@@ -2131,6 +2276,11 @@
         s = s.replace(/\.$/, '');
         return s;
     }
+
+    // Advisory preflight: warn about AE features the exporter doesn't carry
+    // across so the user isn't surprised by a missing look.  Non-blocking —
+    // defaults to proceed; cancel aborts before any work or backup.
+    if (!warnUnsupportedFeatures(layerInfos)) return;
 
     // Open the live progress palette now — every long phase below feeds it.
     // The export already passed every preflight; this palette stays up
@@ -2324,6 +2474,7 @@
             anyProbeNeeded = true; break;
         }
     }
+    sweepStaleProbes();   // clear any leaked probes from a prior crashed run
     if (anyProbeNeeded) app.beginUndoGroup("AE USD Exporter — sample (probes)");
 
     progress.update("Sampling transforms…",
@@ -2417,7 +2568,7 @@
             var rp = readRot(layer, t);
             var Rae;
             if (nfo.use2Node) {
-                var poi;
+                var poi = null;
                 if (poiProbe) {
                     // Probe null reads parent-local POI via expression — works
                     // when both camera AND parent animate; ExtendScript's own
@@ -2425,14 +2576,22 @@
                     try { poi = poiProbe.position.valueAtTime(t, false); }
                     catch (e) { poi = null; }
                 }
-                if (!poi) {
-                    // No probe (root-parented / probe creation failed): POI is
-                    // already in the right space (world == parent for roots).
+                if (!poi && !layer.parent) {
+                    // Unparented: world == parent space, so the raw POI shares
+                    // rawPos's frame and lookAt is valid.
                     try { poi = layer.pointOfInterest.valueAtTime(t, false); }
-                    catch (e) { poi = [rawPos[0], rawPos[1], rawPos[2]]; }
+                    catch (e) { poi = null; }
                 }
-                Rae = m3mul(lookAtMatrix(rawPos, poi),
-                            aeRotMatrix(rp.ori, rp.xr, rp.yr, rp.zr));
+                if (poi) {
+                    Rae = m3mul(lookAtMatrix(rawPos, poi),
+                                aeRotMatrix(rp.ori, rp.xr, rp.yr, rp.zr));
+                } else {
+                    // Parented 2-node with no probe (probe creation failed):
+                    // pointOfInterest is WORLD-space but rawPos is parent-local,
+                    // so a lookAt would mix frames and aim the camera wrong.
+                    // Fall back to orientation-only rather than emit a bad aim.
+                    Rae = aeRotMatrix(rp.ori, rp.xr, rp.yr, rp.zr);
+                }
             } else {
                 Rae = aeRotMatrix(rp.ori, rp.xr, rp.yr, rp.zr);
             }
@@ -2720,6 +2879,35 @@
     // Recursive prim writer — emits a `def` block at the given indent and
     // recurses into nfo.children with one extra level of indentation.
     var primsBuilt;   // initialised right before the build loop runs
+    // Layer comment + markers → USD customData (static metadata).  customData
+    // has no timeSamples, so markers become parallel frame + name arrays under
+    // ae:markerFrames / ae:markerNames rather than a timed attribute.  No-op
+    // when the layer has neither.
+    function emitLayerCustomData(arr, ind, layer) {
+        var inner = [];
+        var cmt = "";
+        try { cmt = layer.comment || ""; } catch (e) {}
+        if (cmt) inner.push(ind + I1 + 'string ae:comment = "' + esc(cmt) + '"');
+        try {
+            var mk = layer.property("ADBE Marker");
+            if (mk && mk.numKeys && mk.numKeys > 0) {
+                var frames = [], names = [];
+                for (var k = 1; k <= mk.numKeys; k++) {
+                    frames.push(Math.round(mk.keyTime(k) * fps) + frameOffset);
+                    var cm = "";
+                    try { cm = mk.keyValue(k).comment || ""; } catch (e) {}
+                    names.push('"' + esc(cm) + '"');
+                }
+                inner.push(ind + I1 + 'int[] ae:markerFrames = [' + frames.join(', ') + ']');
+                inner.push(ind + I1 + 'string[] ae:markerNames = [' + names.join(', ') + ']');
+            }
+        } catch (e) {}
+        if (!inner.length) return;
+        arr.push(ind + 'customData = {');
+        for (var i = 0; i < inner.length; i++) arr.push(inner[i]);
+        arr.push(ind + '}');
+    }
+
     function writePrim(nfo, ind) {
         var ind2 = ind + I1;
         // Tick once per prim (incl. nested children), so deeply-parented
@@ -2736,10 +2924,12 @@
             out.push(ind + 'def ' + nfo.usdType + ' "' + nfo.primName + '" (');
             out.push(ind2 + 'prepend apiSchemas = ["ShapingAPI"]');
             out.push(ind2 + 'doc = "' + esc(nfo.layer.name) + '  [' + nfo.subtype + camNote + ']"');
+            emitLayerCustomData(out, ind2, nfo.layer);
             out.push(ind + ')');
         } else {
             out.push(ind + 'def ' + nfo.usdType + ' "' + nfo.primName + '" (');
             out.push(ind2 + 'doc = "' + esc(nfo.layer.name) + '  [' + nfo.subtype + camNote + ']"');
+            emitLayerCustomData(out, ind2, nfo.layer);
             out.push(ind + ')');
         }
         out.push(ind + '{');
@@ -3079,25 +3269,47 @@
     // points so AE's rotation/scale pivot lines up.  AE Y-down → USD Y-up.
     // First fill colour wins for displayColor (USD Mesh has one displayColor
     // per prim; per-path colour would need separate sub-prims).
+    // Group paths by fill colour so a multi-colour shape/text layer emits one
+    // sub-Mesh per distinct colour instead of flattening to the first fill
+    // (which also z-fought).  A glyph's outer + counter share one fill → they
+    // land in the same group and hole-subtract correctly; genuinely different
+    // colours become separate meshes.
+    function groupPathsByColor(paths) {
+        var groups = [], map = {};
+        for (var i = 0; i < paths.length; i++) {
+            var p = paths[i];
+            var c = p.color || [0.5, 0.5, 0.5];
+            var key = fmt6(c[0]) + '_' + fmt6(c[1]) + '_' + fmt6(c[2]);
+            if (!map.hasOwnProperty(key)) { map[key] = groups.length; groups.push({ paths: [] }); }
+            groups[map[key]].paths.push(p);
+        }
+        return groups;
+    }
+
     function writeVectorMesh(arr, ind, nfo, paths) {
         var anchor = [0, 0, 0];
         try { anchor = nfo.layer.anchorPoint.value; } catch (e) {}
 
-        var snap = buildMeshSnapshot(paths, anchor);
-        if (!snap) return false;
-
+        var groups = groupPathsByColor(paths);
         var ind2 = ind + I1;
-        arr.push(ind + 'def Mesh "geo"');
-        arr.push(ind + '{');
-        arr.push(ind2 + 'point3f[] points = [' + snap.pointStrs.join(', ') + ']');
-        arr.push(ind2 + 'int[] faceVertexCounts = [' + snap.faceCounts.join(', ') + ']');
-        arr.push(ind2 + 'int[] faceVertexIndices = [' + snap.faceIndices.join(', ') + ']');
-        arr.push(ind2 + 'bool doubleSided = 1');
-        arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
-            fmt(snap.displayColor[0]) + ', ' + fmt(snap.displayColor[1]) + ', ' + fmt(snap.displayColor[2]) + ')]');
-        writeDisplayOpacity(arr, ind2, nfo.opS);
-        arr.push(ind + '}');
-        return true;
+        var emitted = 0;
+        for (var g = 0; g < groups.length; g++) {
+            var snap = buildMeshSnapshot(groups[g].paths, anchor);
+            if (!snap) continue;
+            var name = (emitted === 0) ? 'geo' : 'geo_' + (emitted + 1);
+            arr.push(ind + 'def Mesh "' + name + '"');
+            arr.push(ind + '{');
+            arr.push(ind2 + 'point3f[] points = [' + snap.pointStrs.join(', ') + ']');
+            arr.push(ind2 + 'int[] faceVertexCounts = [' + snap.faceCounts.join(', ') + ']');
+            arr.push(ind2 + 'int[] faceVertexIndices = [' + snap.faceIndices.join(', ') + ']');
+            arr.push(ind2 + 'bool doubleSided = 1');
+            arr.push(ind2 + 'color3f[] primvars:displayColor = [(' +
+                fmt(snap.displayColor[0]) + ', ' + fmt(snap.displayColor[1]) + ', ' + fmt(snap.displayColor[2]) + ')]');
+            writeDisplayOpacity(arr, ind2, nfo.opS);
+            arr.push(ind + '}');
+            emitted++;
+        }
+        return emitted > 0;
     }
 
     // Animated vector mesh — emits a Mesh whose points (and, if vertex count
@@ -3274,9 +3486,8 @@
         var anchor = [0, 0, 0];
         try { anchor = nfo.layer.anchorPoint.value; } catch (e) {}
 
-        var allPts = [], curveCounts = [];
+        var allPts = [], curveCounts = [], widths = [];
         var displayColor = [0.5, 0.5, 0.5], foundColor = false;
-        var widthPx = 2;
 
         for (var pi = 0; pi < paths.length; pi++) {
             var p = paths[pi];
@@ -3289,15 +3500,21 @@
             // the polyline visually closes (BasisCurves type=linear is open).
             var closed = (p.closed !== false);
             var n = poly.length + (closed ? 1 : 0);
+            // Per-path stroke width (USD widths are per-vertex), so a layer with
+            // mixed-width strokes renders each correctly instead of sharing the
+            // last-seen width.
+            var wUnits = ((typeof p.strokeWidth === "number") ? p.strokeWidth : 2) / scale;
             for (var v = 0; v < poly.length; v++) {
                 var ux = (poly[v][0] - anchor[0]) / scale;
                 var uy = -(poly[v][1] - anchor[1]) / scale;
                 allPts.push('(' + fmt(ux) + ', ' + fmt(uy) + ', 0)');
+                widths.push(fmt(wUnits));
             }
             if (closed) {
                 var ux0 = (poly[0][0] - anchor[0]) / scale;
                 var uy0 = -(poly[0][1] - anchor[1]) / scale;
                 allPts.push('(' + fmt(ux0) + ', ' + fmt(uy0) + ', 0)');
+                widths.push(fmt(wUnits));
             }
             curveCounts.push(n);
 
@@ -3305,11 +3522,9 @@
                 displayColor = [p.strokeColor[0], p.strokeColor[1], p.strokeColor[2]];
                 foundColor = true;
             }
-            if (typeof p.strokeWidth === "number") widthPx = p.strokeWidth;
         }
 
         if (!allPts.length) return false;
-        var widthUnits = widthPx / scale;
 
         var ind2 = ind + I1;
         var ind3 = ind2 + I1;
@@ -3318,8 +3533,6 @@
         arr.push(ind2 + 'uniform token type = "linear"');
         arr.push(ind2 + 'int[] curveVertexCounts = [' + curveCounts.join(', ') + ']');
         arr.push(ind2 + 'point3f[] points = [' + allPts.join(', ') + ']');
-        var widths = [];
-        for (var w = 0; w < allPts.length; w++) widths.push(fmt(widthUnits));
         arr.push(ind2 + 'float[] widths = [' + widths.join(', ') + '] (');
         arr.push(ind3 + 'interpolation = "vertex"');
         arr.push(ind2 + ')');
@@ -3394,6 +3607,7 @@
         arr.push(ind2 + 'doc = "' + esc(nfo.layer.name) + '  [' + label + ']"');
         arr.push(ind + ')');
         arr.push(ind + '{');
+        arr.push(ind2 + 'uniform token purpose = "guide"');   // trajectory viz — excluded from final renders
         arr.push(ind2 + 'uniform token type = "linear"');
         arr.push(ind2 + 'int[] curveVertexCounts = [' + pts.length + ']');
         arr.push(ind2 + 'point3f[] points = [' + pts.join(', ') + ']');
@@ -3576,37 +3790,43 @@
     // UCS-2 JS string → UTF-8 byte string (each char's low byte == one UTF-8
     // byte, suitable for File.write() under encoding = "binary").
     function toUtf8Bytes(s) {
-        var out = "";
-        for (var i = 0; i < s.length; i++) {
+        // Build into an array and join once (O(n)).  The previous char-by-char
+        // `out += …` was O(n²) under ExtendScript's string model and dominated
+        // the write phase on large animated exports.  ASCII runs are copied in
+        // one slice so the common all-ASCII document barely touches this loop.
+        var out = [], n = s.length, i = 0;
+        while (i < n) {
+            var start = i;
+            while (i < n && s.charCodeAt(i) < 0x80) i++;
+            if (i > start) { out.push(s.substring(start, i)); if (i >= n) break; }
             var c = s.charCodeAt(i);
-            if (c < 0x80) {
-                out += String.fromCharCode(c);
-            } else if (c < 0x800) {
-                out += String.fromCharCode(0xC0 | (c >>> 6));
-                out += String.fromCharCode(0x80 | (c & 0x3F));
-            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < s.length) {
-                // Surrogate pair → 4-byte sequence
+            if (c < 0x800) {
+                out.push(String.fromCharCode(0xC0 | (c >>> 6), 0x80 | (c & 0x3F)));
+                i++;
+            } else if (c >= 0xD800 && c <= 0xDBFF && i + 1 < n) {
                 var c2 = s.charCodeAt(i + 1);
                 if (c2 >= 0xDC00 && c2 <= 0xDFFF) {
+                    // Surrogate pair → 4-byte sequence
                     var cp = 0x10000 + ((c - 0xD800) << 10) + (c2 - 0xDC00);
-                    out += String.fromCharCode(0xF0 | (cp >>> 18));
-                    out += String.fromCharCode(0x80 | ((cp >>> 12) & 0x3F));
-                    out += String.fromCharCode(0x80 | ((cp >>> 6)  & 0x3F));
-                    out += String.fromCharCode(0x80 | ( cp         & 0x3F));
+                    out.push(String.fromCharCode(
+                        0xF0 | (cp >>> 18),
+                        0x80 | ((cp >>> 12) & 0x3F),
+                        0x80 | ((cp >>> 6)  & 0x3F),
+                        0x80 | ( cp         & 0x3F)));
+                    i += 2;
+                } else {
+                    // Lone high surrogate → 3-byte emit
+                    out.push(String.fromCharCode(
+                        0xE0 | (c >>> 12), 0x80 | ((c >>> 6) & 0x3F), 0x80 | (c & 0x3F)));
                     i++;
-                    continue;
                 }
-                // Lone high surrogate — fall through to 3-byte emit
-                out += String.fromCharCode(0xE0 | (c >>> 12));
-                out += String.fromCharCode(0x80 | ((c >>> 6) & 0x3F));
-                out += String.fromCharCode(0x80 | (c & 0x3F));
             } else {
-                out += String.fromCharCode(0xE0 | (c >>> 12));
-                out += String.fromCharCode(0x80 | ((c >>> 6) & 0x3F));
-                out += String.fromCharCode(0x80 | (c & 0x3F));
+                out.push(String.fromCharCode(
+                    0xE0 | (c >>> 12), 0x80 | ((c >>> 6) & 0x3F), 0x80 | (c & 0x3F)));
+                i++;
             }
         }
-        return out;
+        return out.join("");
     }
 
 })();

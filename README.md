@@ -93,12 +93,16 @@ Matches AE's render-time visibility:
 
 ## Known limitations
 
-- Text and shape geometry is **triangulated outline only** for fills, plus a sibling **`BasisCurves`** for stroke-only paths.  Gradients, multi-fill effects, drop-shadows etc. are not represented (a multi-colour fill flattens to its first colour).  Counters (letter "O", "8") are subtracted; deeply-nested compound shapes ("@") fall back to filled.  Trim Paths, Merge Paths, Repeater, Wiggle Paths and other shape operators are skipped silently — the layer falls back to a bounding-box quad if no extractable paths are found.
+- Text and shape geometry is **triangulated outline only** for fills, plus a sibling **`BasisCurves`** for stroke-only paths.  Distinct fill colours each become their own sub-Mesh; counters (letter "O", "8") are subtracted; deeply-nested compound shapes ("@") fall back to filled.  **Trim Paths** is supported (Start/End/Offset, per-path).  Merge Paths, Repeater, Wiggle Paths, Pucker & Bloat and Twist are skipped silently — the layer falls back to a bounding-box quad if no extractable paths are found.  Gradients and drop-shadows are not represented.
 - Layers parented to a non-exported (2D) layer become roots with a parent-relative transform — world position will be wrong. The 2D-layer preflight catches this when the parent is in the same comp.
 - Camera **film width** isn't reachable from ExtendScript, so the dialog asks for it (default 36 mm).  If your AE comp uses APS-C / S35 / etc., set the value before exporting.
 - Lights export the AE light type and intensity/colour/cone params but haven't been visually verified across all four light types in Houdini/Karma.
 - **Animated shape geometry** (path keyframes, animated Vector Group transforms) is detected via a recursive walk of the layer's contents and emits per-frame timeSampled mesh data, matching the text path.
 - **Animated text** runs `Create Shapes from Text` once per frame to capture per-frame glyph state.  This is slow on long ranges with many text layers (≈ 100 ms per frame per layer) and increases USD file size proportionally — only triggered when the layer actually has sourceText keys / animators / expression.
+
+### Explicit non-goals (not exported)
+
+Masks, track mattes, blend modes, effects, motion blur, audio, and physically-based materials are **not** exported — a quick preflight warns you when the selected layers use any of them.  Layer opacity (→ `displayOpacity` / texture alpha) and camera depth-of-field (`fStop` gated on AE's DoF toggle) **are** exported; layer comments and markers ride along as USD `customData`.
 
 ## Cross-references
 
